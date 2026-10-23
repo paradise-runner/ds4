@@ -69,8 +69,9 @@ class Model:
 
     def rope(self, x, pos):  # x [..., hd]; NeoX pairs (i, i + n_rot/2) over the first n_rot dims
         half = self.n_rot // 2
-        freq = self.theta ** (-np.arange(half, dtype=np.float64) * 2.0 / self.n_rot)
-        ang = pos * freq
+        # float32 inverse frequencies and angle, as vLLM's cos/sin cache
+        freq = (1.0 / self.theta ** (np.arange(0, self.n_rot, 2, dtype=np.float32) / self.n_rot)).astype(np.float32)
+        ang = (np.float32(pos) * freq).astype(np.float64)
         c, s = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
         x = x.copy()
         a, b = x[..., :half].copy(), x[..., half:self.n_rot].copy()

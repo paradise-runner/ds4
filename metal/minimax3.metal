@@ -19,7 +19,8 @@ struct ds4_metal_args_mm3_attn_prep {
 };
 
 // Gemma-folded RMSNorm (the converter stores 1 + w) and NeoX RoPE over the
-// first 64 of 128 dims.  Lane l owns dims 4l..4l+3; the partner of dim d < 32
+// first 64 of 128 dims.  The angle is a float32 product, as in vLLM's cos/sin
+// cache; precise:: cos/sin keep it exact at million-token positions.  Lane l owns dims 4l..4l+3; the partner of dim d < 32
 // is d + 32, which lives four lanes x two = eight lanes up.
 static inline void mm3_norm_rope(thread float *v, device const float *g, uint pos,
                                  constant float *freq, float eps, ushort lane) {
@@ -34,12 +35,12 @@ static inline void mm3_norm_rope(thread float *v, device const float *g, uint po
     if (lane < 8) {
         for (uint k = 0; k < 4; k++) {
             const float th = (float)pos * freq[lane * 4 + k];
-            v[k] = v[k] * cos(th) - other[k] * sin(th);
+            v[k] = v[k] * precise::cos(th) - other[k] * precise::sin(th);
         }
     } else if (lane < 16) {
         for (uint k = 0; k < 4; k++) {
             const float th = (float)pos * freq[lane * 4 + k - 32];
-            v[k] = other[k] * sin(th) + v[k] * cos(th);
+            v[k] = other[k] * precise::sin(th) + v[k] * precise::cos(th);
         }
     }
 }
