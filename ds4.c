@@ -497,7 +497,7 @@ enum {
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 2,
+    DS4_MAX_HEAD_KV          = 4,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -527,6 +527,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_MINIMAX3  = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +538,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_MINIMAX31_FLASH = 7,
 } ds4_variant;
 
 typedef struct {
@@ -838,6 +840,40 @@ static const ds4_shape DS4_SHAPE_QWEN4_EXP = {
     .rope_orig_ctx = 262144,
 };
 
+/* MiniMax-M3.1-Flash: 60 layers of GQA attention (64 query heads over 4 KV
+ * heads) with MiniMax Sparse Attention, three dense FFN layers, then
+ * sigmoid-routed MoE (4 of 128 experts plus one shared).  The indexer has one
+ * query head per KV head over a single shared index key; n_swa holds the
+ * 128-token sparse block and n_indexer_top_k the 16 attended blocks. */
+static const ds4_shape DS4_SHAPE_MINIMAX31_FLASH = {
+    .name = "MiniMax-M3.1-Flash",
+    .family = DS4_MODEL_FAMILY_MINIMAX3,
+    .variant = DS4_VARIANT_MINIMAX31_FLASH,
+    .n_layer = 60,
+    .n_embd = 6144,
+    .n_vocab = 200064,
+    .n_head = 64,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 128,
+    .n_expert_used = 4,
+    .n_expert_shared = 1,
+    .n_ff_exp = 3072,
+    .n_ff_dense = 12288,
+    .n_leading_dense = 3,
+    .n_swa = 128,
+    .n_indexer_head = 4,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 16,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 2.0f,
+    .swiglu_clamp_exp = 7.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 /* Synthetic test model: same structure at toy widths, real tokenizer. */
 static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .name = "Qwen3.8 Flash Next mini",
@@ -1008,6 +1044,10 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
 
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+}
+
+static bool ds4_model_is_minimax3(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MINIMAX3;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -5346,7 +5386,7 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5362,7 +5402,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5639,10 +5679,79 @@ static void weights_validate_qwen4_layout(
     }
 }
 
+static bool weights_minimax3_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l || !l->attn_norm || !l->attn_q || !l->attn_k || !l->attn_v || !l->attn_output ||
+        !l->attn_q_norm || !l->attn_k_norm || !l->indexer_q_proj || !l->indexer_k_proj ||
+        !l->indexer_q_norm || !l->indexer_k_norm || !l->ffn_norm) {
+        return false;
+    }
+    if (il < DS4_N_LEADING_DENSE) return l->ffn_gate && l->ffn_up && l->ffn_down;
+    return l->ffn_gate_inp && l->ffn_exp_probs_b && l->ffn_gate_exps && l->ffn_up_exps &&
+           l->ffn_down_exps && l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+}
+
+static void weights_validate_minimax3_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t E = DS4_N_EMBD, D = DS4_N_HEAD_DIM;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_start > layer_end || layer_end >= DS4_N_LAYER) {
+        ds4_die("invalid layer range in MiniMax weight layout validation");
+    }
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) tensor_expect_qwen4_dense_layout(w->token_embd, 2, E, DS4_N_VOCAB, 0);
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_qwen4_dense_layout(w->output, 2, E, DS4_N_VOCAB, 0);
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_minimax3_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required MiniMax tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_q, 2, E, (uint64_t)DS4_N_HEAD * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_k, 2, E, (uint64_t)DS4_N_HEAD_KV * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_v, 2, E, (uint64_t)DS4_N_HEAD_KV * D, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_output, 2, (uint64_t)DS4_N_HEAD * D, E, 0);
+        tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, E,
+                                         (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_qwen4_dense_layout(l->indexer_k_proj, 2, E, DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, D, 0, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, D, 0, 0);
+        tensor_expect_layout(l->indexer_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        if (il < DS4_N_LEADING_DENSE) {
+            tensor_expect_qwen4_dense_layout(l->ffn_gate, 2, E, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_up, 2, E, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_down, 2, DS4_N_FF_DENSE, E, 0);
+            continue;
+        }
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, E, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen4_expert_layout(l->ffn_up_exps, E, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, E, DS4_N_EXPERT);
+        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp, 2, E, DS4_N_FF_EXP, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E, 0);
+    }
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
+    }
+    if (ds4_model_is_minimax3()) {
+        return weights_minimax3_layer_has_required(l, il);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
@@ -5902,6 +6011,11 @@ static void weights_validate_layout(
     if (ds4_model_is_qwen4()) {
         weights_validate_qwen4_layout(w, layer_start, layer_end,
                                       require_token_embd, require_output);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        weights_validate_minimax3_layout(w, layer_start, layer_end,
+                                         require_token_embd, require_output);
         return;
     }
 
@@ -7153,6 +7267,54 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Metadata written by gguf-tools/minimax31_quantize.py.  Every value the
+ * graph hard-codes is checked here so a different checkpoint fails at load. */
+static void config_validate_minimax3_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_MINIMAX31_FLASH;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    const char *a = "minimax-m3";
+    char key[128];
+#define MM3_U32(name_, expected_) do { \
+        snprintf(key, sizeof(key), "%s.%s", a, name_); \
+        config_expect_u32(name_, required_u32(m, key), (expected_)); \
+    } while (0)
+#define MM3_F32(name_, expected_) do { \
+        snprintf(key, sizeof(key), "%s.%s", a, name_); \
+        config_expect_f32(name_, required_f32(m, key), (expected_)); \
+    } while (0)
+    MM3_U32("block_count", DS4_N_LAYER);
+    MM3_U32("embedding_length", DS4_N_EMBD);
+    MM3_U32("vocab_size", DS4_N_VOCAB);
+    MM3_U32("feed_forward_length", DS4_N_FF_DENSE);
+    MM3_U32("expert_feed_forward_length", DS4_N_FF_EXP);
+    MM3_U32("expert_count", DS4_N_EXPERT);
+    MM3_U32("expert_used_count", DS4_N_EXPERT_USED);
+    MM3_U32("expert_shared_count", DS4_N_EXPERT_SHARED);
+    MM3_U32("leading_dense_block_count", DS4_N_LEADING_DENSE);
+    MM3_F32("expert_weights_scale", DS4_EXPERT_WEIGHT_SCALE);
+    MM3_F32("swiglu_alpha", 1.702f);   /* the Metal SwiGLU-OAI kernels fix both constants */
+    MM3_F32("swiglu_limit", DS4_SWIGLU_CLAMP_EXP);
+    MM3_U32("attention.head_count", DS4_N_HEAD);
+    MM3_U32("attention.head_count_kv", DS4_N_HEAD_KV);
+    MM3_U32("attention.key_length", DS4_N_HEAD_DIM);
+    MM3_U32("attention.value_length", DS4_N_VALUE_DIM);
+    MM3_U32("rope.dimension_count", DS4_N_ROT);
+    MM3_F32("rope.freq_base", DS4_ROPE_FREQ_BASE);
+    MM3_U32("attention.indexer.head_count", DS4_N_INDEXER_HEAD);
+    MM3_U32("attention.indexer.key_length", DS4_N_INDEXER_HEAD_DIM);
+    MM3_U32("attention.sparse.block_size", DS4_N_SWA);
+    MM3_U32("attention.sparse.top_k_blocks", DS4_N_INDEXER_TOP_K);
+    MM3_U32("attention.sparse.init_blocks", 0);
+    MM3_U32("attention.sparse.local_blocks", 1);
+#undef MM3_U32
+#undef MM3_F32
+    snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", a);
+    config_expect_epsilon("attention.layer_norm_rms_epsilon", required_f32(m, key), DS4_RMS_EPS);
+    snprintf(key, sizeof(key), "%s.expert_weights_norm", a);
+    bool norm = false;
+    if (!model_get_bool(m, key, &norm) || !norm) ds4_die("minimax-m3 expects normalized expert weights");
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7171,6 +7333,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "minimax-m3")) {
+            config_validate_minimax3_model(m);
             return;
         }
     }
@@ -7662,7 +7828,7 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7825,9 +7991,42 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+static void weights_bind_minimax3_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q         = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k         = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v         = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_q_norm    = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm    = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->indexer_q_proj = required_tensorf(m, "blk.%u.indexer.q_proj.weight", il);
+    l->indexer_k_proj = required_tensorf(m, "blk.%u.indexer.k_proj.weight", il);
+    l->indexer_q_norm = required_tensorf(m, "blk.%u.indexer.q_norm.weight", il);
+    l->indexer_k_norm = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+    l->ffn_norm       = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    if (il < DS4_N_LEADING_DENSE) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        return;
+    }
+    l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        weights_bind_minimax3_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -44130,6 +44329,135 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+#include "ds4_minimax3_unicode.inc"
+
+#define DS4_MINIMAX3_CLASS(name_, cp_) \
+    qwen4_urange_has(ds4_minimax3_##name_##_ranges, \
+                     sizeof(ds4_minimax3_##name_##_ranges) / sizeof(ds4_minimax3_##name_##_ranges[0]), (cp_))
+
+/* (?i:'s|'t|'re|'ve|'m|'ll|'d) at pos: end of the suffix, or pos. */
+static uint64_t minimax3_contraction(const char *s, uint64_t len, uint64_t pos) {
+    if (pos + 1 >= len || s[pos] != '\'') return pos;
+    const uint32_t c1 = ascii_tolower_cp((uint8_t)s[pos + 1]);
+    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return pos + 2;
+    if (pos + 2 >= len) return pos;
+    const uint32_t c2 = ascii_tolower_cp((uint8_t)s[pos + 2]);
+    if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) return pos + 3;
+    return pos;
+}
+
+/* One cased-word alternative at q, U = [Lu Lt Lm Lo M], L = [Ll Lm Lo M]:
+ * second=false is U*L+c?, second=true is U+L*c? (c the contraction).
+ * Lm/Lo/M are in both classes, so for U*L+ the greedy U run backtracks to
+ * its last L member when the char after it is not in L.  Returns the match
+ * end, or 0 when the alternative fails. */
+static uint64_t minimax3_word(const char *s, uint64_t len, uint64_t q, bool second) {
+    uint64_t p = q, last_l = UINT64_MAX;
+    while (p < len) {
+        qwen4_char_info c = qwen4_char_at(s, len, p);
+        if (!c.valid || !DS4_MINIMAX3_CLASS(upper, c.cp)) break;
+        if (DS4_MINIMAX3_CLASS(lower, c.cp)) last_l = p;
+        p = c.next;
+    }
+    qwen4_char_info after = qwen4_char_at(s, len, p);
+    const bool l_after = after.valid && DS4_MINIMAX3_CLASS(lower, after.cp);
+    uint64_t end;
+    if (second) {
+        if (p == q) return 0;
+        end = p;
+    } else if (l_after) {
+        end = p;
+    } else if (last_l != UINT64_MAX) {
+        end = last_l;
+    } else {
+        return 0;
+    }
+    while (end < len) {
+        qwen4_char_info c = qwen4_char_at(s, len, end);
+        if (!c.valid || !DS4_MINIMAX3_CLASS(lower, c.cp)) break;
+        end = c.next;
+    }
+    return minimax3_contraction(s, len, end);
+}
+
+/* MiniMax-M3 pre-tokenization (tokenizer.ggml.pre = "minimax-m2"), the
+ * o200k-style ordered alternation
+ *   [^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? | \p{N}{1,3} |
+ *    ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * shortcut: no NFC normalization of the input (tokenizer.json asks for NFC);
+ * add it if decomposed text shows up in prompts. */
+static void bpe_tokenize_text_minimax3(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t start = pos;
+        qwen4_char_info cur = qwen4_char_at(text, len, pos);
+        if (!cur.valid) break;
+
+        /* each word alternative tries its optional prefix first, in order */
+        const bool prefix = cur.cp != '\r' && cur.cp != '\n' && !cur.letter && !cur.number && cur.next < len;
+        uint64_t end = 0;
+        for (int alt = 0; alt < 2 && !end; alt++) {
+            if (prefix) end = minimax3_word(text, len, cur.next, alt);
+            if (!end) end = minimax3_word(text, len, pos, alt);
+        }
+        if (end) {
+            pos = end;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        if (cur.number) {
+            pos = cur.next;
+            for (int n = 1; n < 3 && pos < len; n++) {
+                qwen4_char_info c = qwen4_char_at(text, len, pos);
+                if (!c.valid || !c.number) break;
+                pos = c.next;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        {
+            uint64_t p = cur.cp == ' ' ? cur.next : pos;
+            qwen4_char_info c = qwen4_char_at(text, len, p);
+            if (c.valid && !c.space && !c.letter && !c.number) {
+                while (p < len) {
+                    c = qwen4_char_at(text, len, p);
+                    if (!c.valid || c.space || c.letter || c.number) break;
+                    p = c.next;
+                }
+                while (p < len && (text[p] == '\r' || text[p] == '\n' || text[p] == '/')) p++;
+                pos = p;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        if (cur.space) {
+            uint64_t p = pos, last_newline_end = 0, last_ws_start = pos;
+            int nspace = 0;
+            while (p < len) {
+                qwen4_char_info scan = qwen4_char_at(text, len, p);
+                if (!scan.valid || !scan.space) break;
+                last_ws_start = p;
+                if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
+                p = scan.next;
+                nspace++;
+            }
+            if (last_newline_end) pos = last_newline_end;
+            else if (nspace > 1 && p < len) pos = last_ws_start;
+            else pos = p;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        pos = cur.next;
+        if (pos == start) pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -44155,6 +44483,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (ds4_model_is_qwen4()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
+    if (ds4_model_is_minimax3()) {
+        bpe_tokenize_text_minimax3(vocab, text, out);
         return;
     }
 
@@ -44303,6 +44635,24 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_key_end_id = -1;
         vocab->arg_value_start_id = -1;
         vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
+    if (ds4_model_is_minimax3()) {
+        /* ]~b] opens every role block and [e~[ closes it; ]~!b[ (kept in
+         * sop_id) starts the document once.  Thinking uses <mm:think>; the
+         * plain <think> tokens are ordinary text to this template. */
+        vocab->bos_id = vocab_lookup(vocab, "]~b]");
+        vocab->eos_id = vocab_lookup(vocab, "[e~[");
+        vocab->sop_id = vocab_lookup(vocab, "]~!b[");
+        vocab->think_start_id = vocab_lookup(vocab, "<mm:think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</mm:think>");
+        vocab->system_id = vocab->user_id = vocab->assistant_id = vocab->observation_id = -1;
+        vocab->tool_call_start_id = vocab->tool_call_end_id = -1;
+        vocab->tool_response_start_id = vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = vocab->arg_value_end_id = -1;
         vocab->dsml_id = -1;
         return;
     }
@@ -44460,12 +44810,105 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* MiniMax-M3.1 chat (chat_template.jinja): a root system block with the
+ * fixed identity and thinking instructions, a developer block carrying the
+ * caller's system prompt (or the default identity), then user/ai/tool
+ * blocks, each "]~b]role\n ... [e~[\n".  Thinking is adaptive: the template
+ * adds no prefix, and a disabled turn starts right after </mm:think>. */
+static const char *DS4_MINIMAX3_ROOT_SYSTEM =
+    "Your model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. "
+    "Founded in early 2022, MiniMax is a global AI foundation model company committed to "
+    "advancing the frontiers of AI towards AGI."
+    "\n\n<thinking_instructions>\n"
+    "You have a thinking capability that allows you to reason step by step before responding. "
+    "When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your "
+    "response. When thinking is disabled, begin your response directly after the </mm:think> "
+    "prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n"
+    "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, "
+    "multi-step reasoning, or when analyzing function/tool results.\n"
+    "</thinking_instructions>"
+    "\n\n<model_id>8bb8149fe</model_id>";
+
+/* reasoning_effort for the root block; HIGH keeps the template default */
+static const char *minimax3_effort(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_LOW:    return "low";
+    case DS4_THINK_MEDIUM: return "medium";
+    case DS4_THINK_MAX:    return "max";
+    default:               return NULL;
+    }
+}
+
+static void minimax3_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->bos_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void minimax3_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->eos_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void minimax3_chat_begin(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->sop_id);
+    minimax3_chat_open(vocab, "system", out);
+    bpe_tokenize_text(vocab, DS4_MINIMAX3_ROOT_SYSTEM, out);
+}
+
+/* The root block stays open after begin so the effort tag can follow it;
+ * the first later block closes it, and a conversation that brings no system
+ * prompt gets the template's default developer block. */
+static void minimax3_chat_settle(const ds4_vocab *vocab, token_vec *out, bool developer) {
+    int opened = 0;
+    bool closed = false;
+    for (int i = 0; i < out->len; i++) {
+        opened += out->v[i] == vocab->bos_id;
+        closed |= out->v[i] == vocab->eos_id;
+    }
+    if (!closed) minimax3_chat_close(vocab, out);
+    if (opened == 1 && !developer) {
+        minimax3_chat_open(vocab, "developer", out);
+        bpe_tokenize_text(vocab, "You are a helpful assistant.", out);
+        minimax3_chat_close(vocab, out);
+    }
+}
+
+static void minimax3_chat_think_prefix(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    const char *effort = minimax3_effort(mode);
+    if (!effort) return;
+    bpe_tokenize_text(vocab, "\n\n<effort>", out);
+    bpe_tokenize_text(vocab, effort, out);
+    bpe_tokenize_text(vocab, "</effort>", out);
+}
+
+static void minimax3_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    minimax3_chat_settle(vocab, out, false);
+    minimax3_chat_open(vocab, "ai", out);
+    if (!ds4_think_mode_enabled(mode)) token_vec_push(out, vocab->think_end_id);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_begin(vocab, out);
+        minimax3_chat_think_prefix(vocab, think_mode, out);
+        minimax3_chat_settle(vocab, out, system && system[0]);
+        if (system && system[0]) {
+            minimax3_chat_open(vocab, "developer", out);
+            bpe_tokenize_text(vocab, system, out);
+            minimax3_chat_close(vocab, out);
+        }
+        minimax3_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        minimax3_chat_close(vocab, out);
+        minimax3_chat_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -44595,6 +45038,10 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_begin(&e->vocab, tokens);
+        return;
+    }
     chat_push_bos_sequence(&e->vocab, tokens);
 }
 
@@ -44612,6 +45059,10 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
 }
 
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_think_prefix(&e->vocab, mode, tokens);
+        return;
+    }
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
@@ -44662,6 +45113,31 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (ds4_model_is_minimax3()) {
+        const bool developer = !strcmp(role, "system") || !strcmp(role, "developer");
+        minimax3_chat_settle(vocab, tokens, developer);
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* shortcut: one tool block per result; the template merges
+             * consecutive results into one block.  Merge if parallel tool
+             * calls show quality problems. */
+            minimax3_chat_open(vocab, "tool", tokens);
+            tokens->len--;   /* the tool block has no newline before <response> */
+            bpe_tokenize_text(vocab, "\n<response>", tokens);
+            bpe_tokenize_wrapped_payload_text(vocab, content, "</response>", tokens);
+            bpe_tokenize_text(vocab, "</response>", tokens);
+        } else if (!strcmp(role, "assistant")) {
+            minimax3_chat_open(vocab, "ai", tokens);
+            if (strncmp(content, "<mm:think>", 10) != 0 && strncmp(content, "</mm:think>", 11) != 0)
+                token_vec_push(tokens, vocab->think_end_id);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        } else {
+            minimax3_chat_open(vocab, developer ? "developer" : "user", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        minimax3_chat_close(vocab, tokens);
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
@@ -44729,6 +45205,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_minimax3()) {
+        minimax3_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
