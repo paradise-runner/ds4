@@ -44869,10 +44869,12 @@ static void minimax3_chat_close(const ds4_vocab *vocab, token_vec *out) {
     bpe_tokenize_text(vocab, "\n", out);
 }
 
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text, token_vec *out);
+
 static void minimax3_chat_begin(const ds4_vocab *vocab, token_vec *out) {
     token_vec_push(out, vocab->sop_id);
     minimax3_chat_open(vocab, "system", out);
-    bpe_tokenize_text(vocab, DS4_MINIMAX3_ROOT_SYSTEM, out);
+    tokenize_rendered_chat_vocab(vocab, DS4_MINIMAX3_ROOT_SYSTEM, out);
 }
 
 /* The root block stays open after begin so the effort tag can follow it;
@@ -44979,6 +44981,24 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    if (ds4_model_is_minimax3()) {
+        /* Every MiniMax added token (ids 200000 up) matches by its text, as
+         * tokenizer.json marks none of them normalized; they all start with
+         * '<', ']' or '['.  shortcut: linear scan of the 61 ids, add an index
+         * if rendered chats get large. */
+        if (*p != '<' && *p != ']' && *p != '[') return false;
+        size_t best = 0;
+        for (int id = 200000; id < vocab->n_vocab; id++) {
+            const ds4_str t = vocab->token[id];
+            if (t.len > best && t.ptr[0] == *p && strncmp(p, t.ptr, t.len) == 0) {
+                best = t.len;
+                *token = id;
+            }
+        }
+        if (!best) return false;
+        *len = best;
+        return true;
+    }
     struct special {
         const char *text;
         int token;
