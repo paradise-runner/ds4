@@ -184,8 +184,8 @@ def build_plan(db, artifact):
         a = f"{p}.self_attn"
         add(plan, db, f"blk.{layer}.attn_norm.weight", f"{p}.input_layernorm.weight", QTYPE_F32, "norm", GEMMA_NORM)
         for target, source in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj"),
-                               ("attn_output", "o_proj"), ("indexer.attn_q", "index_q_proj"),
-                               ("indexer.attn_k", "index_k_proj")):
+                               ("attn_output", "o_proj"), ("indexer.q_proj", "index_q_proj"),
+                               ("indexer.k_proj", "index_k_proj")):
             add(plan, db, f"blk.{layer}.{target}.weight", f"{a}.{source}.weight", QTYPE_Q8_0, "attention")
         for target, source in (("attn_q_norm", "q_norm"), ("attn_k_norm", "k_norm"),
                                ("indexer.q_norm", "index_q_norm"), ("indexer.k_norm", "index_k_norm")):
