@@ -3477,6 +3477,40 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Expert GLU of the qwen4 MoE kernels: 0 SiLU (Qwen), 1 SwiGLU-OAI (MiniMax-M3). */
 void ds4_gpu_qwen4_set_moe_act(uint32_t act);
+
+/* MiniMax-M3 kernels (metal/minimax3.metal).  Heads are 128 wide; the
+ * indexer key is one head shared by the Hkv indexer query heads. */
+int ds4_gpu_mm3_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *iq_out, ds4_gpu_tensor *ik_cache,
+        const ds4_gpu_tensor *qp, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *iqp, const ds4_gpu_tensor *ikp,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q, uint64_t g_k, uint64_t g_iq, uint64_t g_ik,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t n_idx_head,
+        uint32_t pos0, uint32_t cache_cap, const float *rope_freq, float eps);
+/* Per-token, per-KV-head block selection into sel[T][Hkv][top_k]; score is
+ * [T][Hkv][score_stride] scratch. */
+int ds4_gpu_mm3_idx_select_tensor(
+        ds4_gpu_tensor *sel, ds4_gpu_tensor *score, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik_cache,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_idx_head, uint32_t block, uint32_t top_k,
+        uint32_t score_stride);
+int ds4_gpu_mm3_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *sel,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t pos0,
+        uint32_t block, uint32_t top_k, float scale);
+int ds4_gpu_mm3_router_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, float scale);
+/* x += sum of weighted expert partials plus the shared expert: shared_src 0
+ * none, 1 part slot n_slots, 2 the separate shared buffer. */
+int ds4_gpu_mm3_moe_reduce_tensor(
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared, uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride,
+        uint32_t dim, uint32_t shared_src);
+int ds4_gpu_mm3_glu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,

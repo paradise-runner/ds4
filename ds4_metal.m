@@ -4785,6 +4785,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
+        @[@"DS4_METAL_MINIMAX3_SOURCE",   @"metal/minimax3.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
     ];
 
@@ -48194,6 +48195,14 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    /* MiniMax-M3 (metal/minimax3.metal), sharing the qwen4 dispatch */
+    QWEN4_K_MM3_ATTN_PREP,
+    QWEN4_K_MM3_IDX_SCORE,
+    QWEN4_K_MM3_IDX_SELECT,
+    QWEN4_K_MM3_ATTN,
+    QWEN4_K_MM3_ROUTER,
+    QWEN4_K_MM3_MOE_REDUCE,
+    QWEN4_K_MM3_GLU,
     QWEN4_K_COUNT,
 };
 
@@ -48299,6 +48308,13 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_mm3_attn_prep",
+    "kernel_mm3_idx_score",
+    "kernel_mm3_idx_select",
+    "kernel_mm3_attn",
+    "kernel_mm3_router",
+    "kernel_mm3_moe_reduce",
+    "kernel_mm3_glu",
 };
 
 typedef struct {
@@ -49875,6 +49891,146 @@ static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     return nt > 1u && (override >= 0 ? override != 0 :
         ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
+}
+
+/* --- MiniMax-M3 ---------------------------------------------------------- */
+
+int ds4_gpu_mm3_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *iq_out, ds4_gpu_tensor *ik_cache,
+        const ds4_gpu_tensor *qp, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *iqp, const ds4_gpu_tensor *ikp,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q, uint64_t g_k, uint64_t g_iq, uint64_t g_ik,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t n_idx_head,
+        uint32_t pos0, uint32_t cache_cap, const float *rope_freq, float eps) {
+    struct { uint32_t n_tokens, n_head, n_head_kv, n_idx_head, pos0, cache_cap; float eps; uint32_t pad0;
+             float rope_freq[32]; } args = { n_tokens, n_head, n_head_kv, n_idx_head, pos0, cache_cap, eps, 0, {0} };
+    memcpy(args.rope_freq, rope_freq, sizeof(args.rope_freq));
+    const uint64_t T = n_tokens, D = 128u;
+    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * D * 2u;
+    qwen4_bind b[14];
+    if (n_tokens == 0 || (uint64_t)pos0 + n_tokens > cache_cap ||
+        !qwen4_bind_tensor(&b[0], qp, T * n_head * D * 4u, "mm3 q projection") ||
+        !qwen4_bind_tensor(&b[1], kp, T * n_head_kv * D * 4u, "mm3 k projection") ||
+        !qwen4_bind_tensor(&b[2], vp, T * n_head_kv * D * 4u, "mm3 v projection") ||
+        !qwen4_bind_tensor(&b[3], iqp, T * n_idx_head * D * 4u, "mm3 indexer q projection") ||
+        !qwen4_bind_tensor(&b[4], ikp, T * D * 4u, "mm3 indexer k projection") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q, D * 4u, "mm3 q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k, D * 4u, "mm3 k_norm") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq, D * 4u, "mm3 indexer q_norm") ||
+        !qwen4_bind_weight(&b[8], model_map, model_size, g_ik, D * 4u, "mm3 indexer k_norm") ||
+        !qwen4_bind_tensor(&b[9], q_out, T * n_head * D * 4u, "mm3 q") ||
+        !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "mm3 k cache") ||
+        !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "mm3 v cache") ||
+        !qwen4_bind_tensor(&b[12], iq_out, T * n_idx_head * D * 4u, "mm3 indexer q") ||
+        !qwen4_bind_tensor(&b[13], ik_cache, (uint64_t)cache_cap * D * 4u, "mm3 indexer k cache")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_MM3_ATTN_PREP, &args, sizeof(args), b, 14,
+                          MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_idx_select_tensor(
+        ds4_gpu_tensor *sel, ds4_gpu_tensor *score, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik_cache,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_idx_head, uint32_t block, uint32_t top_k,
+        uint32_t score_stride) {
+    struct { uint32_t n_tokens, pos0, n_idx_head, block, top_k, stride, pad0, pad1; } args =
+        { n_tokens, pos0, n_idx_head, block, top_k, score_stride, 0, 0 };
+    const uint32_t nb_last = (pos0 + n_tokens - 1u) / block + 1u;
+    qwen4_bind b[4];
+    if (n_tokens == 0 || n_idx_head == 0 || n_idx_head > 4 || block != 128 || top_k == 0 ||
+        nb_last > score_stride ||
+        !qwen4_bind_tensor(&b[0], iq, (uint64_t)n_tokens * n_idx_head * 128u * 4u, "mm3 indexer q") ||
+        !qwen4_bind_tensor(&b[1], ik_cache, (uint64_t)(pos0 + n_tokens) * 128u * 4u, "mm3 indexer k cache") ||
+        !qwen4_bind_tensor(&b[2], score, (uint64_t)n_tokens * n_idx_head * score_stride * 4u, "mm3 scores") ||
+        !qwen4_bind_tensor(&b[3], sel, (uint64_t)n_tokens * n_idx_head * top_k * 4u, "mm3 selection")) {
+        return 0;
+    }
+    /* Every token sees at most top_k blocks: the selection is all of them. */
+    if (nb_last > top_k &&
+        !qwen4_dispatch(QWEN4_K_MM3_IDX_SCORE, &args, sizeof(args), b, 3,
+                        MTLSizeMake(nb_last, n_tokens, 1), MTLSizeMake(128, 1, 1), 0)) {
+        return 0;
+    }
+    const qwen4_bind sb[2] = { b[2], b[3] };
+    return qwen4_dispatch(QWEN4_K_MM3_IDX_SELECT, &args, sizeof(args), sb, 2,
+                          MTLSizeMake(n_idx_head, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *sel,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t pos0,
+        uint32_t block, uint32_t top_k, float scale) {
+    struct { uint32_t n_tokens, n_head, n_head_kv, pos0, block, top_k; float scale; uint32_t pad0; } args =
+        { n_tokens, n_head, n_head_kv, pos0, block, top_k, scale, 0 };
+    const uint32_t group = n_head_kv ? n_head / n_head_kv : 0;
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * 128u * 2u;
+    qwen4_bind b[5];
+    if (n_tokens == 0 || group == 0 || group > 16 || n_head % n_head_kv ||
+        !qwen4_bind_tensor(&b[0], q, (uint64_t)n_tokens * n_head * 128u * 4u, "mm3 attn q") ||
+        !qwen4_bind_tensor(&b[1], k_cache, cache_bytes, "mm3 k cache") ||
+        !qwen4_bind_tensor(&b[2], v_cache, cache_bytes, "mm3 v cache") ||
+        !qwen4_bind_tensor(&b[3], sel, (uint64_t)n_tokens * n_head_kv * top_k * 4u, "mm3 selection") ||
+        !qwen4_bind_tensor(&b[4], out, (uint64_t)n_tokens * n_head * 128u * 4u, "mm3 attn out")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_MM3_ATTN, &args, sizeof(args), b, 5,
+                          MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(32u * group, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_router_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, float scale) {
+    struct { uint32_t n_tokens, n_expert, n_used; float scale; } args = { n_tokens, n_expert, n_used, scale };
+    qwen4_bind b[4];
+    if (n_tokens == 0 || n_expert == 0 || n_expert > 256 || n_used == 0 || n_used > 16 ||
+        !qwen4_bind_tensor(&b[0], logits, (uint64_t)n_tokens * n_expert * 4u, "mm3 router logits") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, bias_offset, (uint64_t)n_expert * 4u, "mm3 router bias") ||
+        !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_used * 4u, "mm3 router selected") ||
+        !qwen4_bind_tensor(&b[3], weights, (uint64_t)n_tokens * n_used * 4u, "mm3 router weights")) {
+        return 0;
+    }
+    const uint32_t nth = (n_expert + 31u) / 32u * 32u;
+    return qwen4_dispatch(QWEN4_K_MM3_ROUTER, &args, sizeof(args), b, 4,
+                          MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(nth, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_moe_reduce_tensor(
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared, uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride,
+        uint32_t dim, uint32_t shared_src) {
+    struct { uint32_t n_tokens, n_slots, part_stride, dim, shared_src, pad0, pad1, pad2; } args =
+        { n_tokens, n_slots, part_stride, dim, shared_src, 0, 0, 0 };
+    qwen4_bind b[4];
+    if (n_tokens == 0 || dim == 0 || shared_src > 2 || part_stride < n_slots + (shared_src == 1 ? 1u : 0u) ||
+        !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * dim * 4u, "mm3 residual") ||
+        !qwen4_bind_tensor(&b[1], part, (uint64_t)n_tokens * part_stride * dim * 4u, "mm3 moe partial") ||
+        !qwen4_bind_tensor(&b[2], weights, (uint64_t)n_tokens * (n_slots ? n_slots : 1u) * 4u, "mm3 moe weights")) {
+        return 0;
+    }
+    if (shared_src == 2) {
+        if (!qwen4_bind_tensor(&b[3], shared, (uint64_t)n_tokens * dim * 4u, "mm3 shared expert")) return 0;
+    } else {
+        b[3] = b[1];
+    }
+    return qwen4_dispatch(QWEN4_K_MM3_MOE_REDUCE, &args, sizeof(args), b, 4,
+                          MTLSizeMake((dim + 255u) / 256u, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_mm3_glu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n) {
+    struct { uint32_t n, pad0, pad1, pad2; } args = { n, 0, 0, 0 };
+    qwen4_bind b[3];
+    if (n == 0 ||
+        !qwen4_bind_tensor(&b[0], gate, (uint64_t)n * 4u, "mm3 glu gate") ||
+        !qwen4_bind_tensor(&b[1], up, (uint64_t)n * 4u, "mm3 glu up") ||
+        !qwen4_bind_tensor(&b[2], out, (uint64_t)n * 4u, "mm3 glu out")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_MM3_GLU, &args, sizeof(args), b, 3,
+                          MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
