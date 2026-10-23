@@ -40648,6 +40648,25 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         return m;
     }
 
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_minimax3()) {
+        /* mirrors mm3_graph_alloc: f16 K/V and an f32 indexer key per token
+         * and layer; transients scale with the prefill chunk */
+        const uint64_t T = prefill_chunk ? prefill_chunk : 1024u;
+        const uint64_t E = DS4_N_EMBD, q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+        const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, slots = DS4_N_EXPERT_USED + 1u;
+        const uint64_t blocks = ctx / DS4_N_SWA + 1u;
+        m.prefill_cap = (uint32_t)T;
+        m.raw_cap = ctx;
+        m.comp_cap = (uint32_t)blocks;
+        m.raw_bytes = (uint64_t)DS4_N_LAYER * ctx * kv_dim * 2u * sizeof(uint16_t);
+        m.compressed_bytes = (uint64_t)DS4_N_LAYER * ctx * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        m.scratch_bytes = (T * (4u * E + 3u * q_dim + 2u * kv_dim + 2u * 512u + 128u + 3u * DS4_N_FF_DENSE +
+                                DS4_N_EXPERT + slots * (E + DS4_N_FF_EXP) + DS4_N_INDEXER_HEAD * blocks) +
+                           (uint64_t)DS4_N_EXPERT * T + DS4_N_VOCAB) * sizeof(float);
+        m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+        return m;
+    }
+
     if (ds4_backend_uses_graph(backend)) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
