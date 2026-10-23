@@ -54,13 +54,23 @@ FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
               -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
-def read_source(hf_dir, name, as_json):
+def read_bytes(hf_dir, name) -> bytes:
     path = os.path.join(hf_dir, name)
     try:
         with open(path, "rb") as fp:
-            return json.load(fp) if as_json else fp.read()
-    except (OSError, ValueError) as error:
-        fail(f"cannot read {path}: {error}")
+            return fp.read()
+    except OSError as error:
+        raise ValueError(f"cannot read {path}: {error}") from error
+
+
+def read_json(hf_dir, name) -> dict:
+    try:
+        document = json.loads(read_bytes(hf_dir, name))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{name}: invalid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise ValueError(f"{name}: expected a JSON object")
+    return document
 
 
 def validate_index(weight_map):
@@ -216,7 +226,7 @@ def kv_i32_array(key, values):
 
 def tokenizer_records(hf_dir):
     """GPT-2 byte-level BPE metadata straight from tokenizer.json."""
-    document = read_source(hf_dir, "tokenizer.json", True)
+    document = read_json(hf_dir, "tokenizer.json")
     model = document.get("model", {})
     if model.get("type") != "BPE" or not isinstance(model.get("merges"), list):
         fail("tokenizer.json is not a BPE tokenizer")
@@ -241,10 +251,11 @@ def tokenizer_records(hf_dir):
 
 
 def model_metadata(hf_dir, source_revision):
-    text = read_source(hf_dir, "config.json", True).get("text_config")
-    if not isinstance(text, dict):
-        fail("config.json has no text_config")
-    sparse = text["sparse_attention_config"]
+    config = read_json(hf_dir, "config.json")
+    if not isinstance(config.get("text_config"), dict):
+        raise ValueError("config.json has no text_config")
+    text: dict = config["text_config"]
+    sparse: dict = text["sparse_attention_config"]
     checks = {
         "hidden_size": N_EMBD, "num_hidden_layers": N_LAYER, "num_local_experts": N_EXPERT,
         "vocab_size": N_VOCAB, "intermediate_size": N_FF_EXP, "num_attention_heads": 64,
@@ -261,7 +272,7 @@ def model_metadata(hf_dir, source_revision):
         fail("converter expects max-score sparse attention in every layer")
     if sparse["sparse_num_index_heads"] != 4 or sparse["sparse_index_dim"] != 128:
         fail("unexpected sparse indexer shape")
-    chat_template = read_source(hf_dir, "chat_template.jinja", False)
+    chat_template = read_bytes(hf_dir, "chat_template.jinja")
     a = ARCH
     return [
         kv_string("general.architecture", a),
