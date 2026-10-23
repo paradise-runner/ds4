@@ -7274,6 +7274,17 @@ static void config_validate_minimax3_model(const ds4_model *m) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     const char *a = "minimax-m3";
     char key[128];
+    /* Validation GGUFs keep a prefix of the layers (gguf-tools/minimax31_truncate.py)
+     * so the graph can be compared with the NumPy reference on machines that
+     * cannot hold all 60. */
+    const uint32_t n_layer = required_u32(m, "minimax-m3.block_count");
+    if (n_layer > DS4_SHAPE_MINIMAX31_FLASH.n_layer || n_layer <= DS4_SHAPE_MINIMAX31_FLASH.n_leading_dense) {
+        fprintf(stderr, "ds4: minimax-m3 block_count %u is outside 4..60\n", n_layer);
+        exit(1);
+    }
+    if (n_layer < DS4_SHAPE_MINIMAX31_FLASH.n_layer)
+        fprintf(stderr, "ds4: warning: truncated MiniMax validation model with %u of 60 layers\n", n_layer);
+    g_ds4_shape.n_layer = n_layer;
 #define MM3_U32(name_, expected_) do { \
         snprintf(key, sizeof(key), "%s.%s", a, name_); \
         config_expect_u32(name_, required_u32(m, key), (expected_)); \
