@@ -163,6 +163,11 @@ void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
 int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
+/* Dispatches between begin and end share one concurrent encoder: no barrier
+ * between them, so they must be independent.  End restores serial order. */
+int ds4_gpu_concurrent_begin(void);
+void ds4_gpu_concurrent_barrier(void);   /* orders the section's earlier dispatches before later ones */
+void ds4_gpu_concurrent_end(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
@@ -3502,9 +3507,11 @@ int ds4_gpu_mm3_idx_select_tensor(
         ds4_gpu_tensor *sel, ds4_gpu_tensor *score, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik_cache,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_idx_head, uint32_t block, uint32_t top_k,
         uint32_t score_stride);
+/* part (optional, [T][H][top_k][132] floats) splits the block list over
+ * threadgroups and merges after: decode has too few (KV head, token) groups. */
 int ds4_gpu_mm3_attn_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache,
-        const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *sel,
+        const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t pos0,
         uint32_t block, uint32_t top_k, float scale);
 int ds4_gpu_mm3_router_tensor(
@@ -3517,7 +3524,24 @@ int ds4_gpu_mm3_moe_reduce_tensor(
         ds4_gpu_tensor *x, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared, uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride,
         uint32_t dim, uint32_t shared_src);
+/* Encode a copy of a/b's first n ids to a shared line; publish_wait commits
+ * the batch and spins until the GPU has written them: out[0..n) a,
+ * out[n..2n) b.  Cheaper than waiting for command-buffer completion on the
+ * decode critical path, and work encoded in between runs meanwhile. */
+int ds4_gpu_mm3_publish(const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n);
+int ds4_gpu_mm3_publish_wait(uint32_t n, int32_t *out);
 int ds4_gpu_mm3_glu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n);
+/* One-token routed experts, selected indexing experts of the given bases:
+ * gate/up pair with SwiGLU-OAI into mid[n_slots][ff_dim]; down from mid into
+ * part[n_slots][out_dim]. */
+int ds4_gpu_mm3_moe_gate_up_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t gate_type, uint32_t n_total_expert, uint32_t n_slots, uint32_t in_dim, uint32_t ff_dim);
+int ds4_gpu_mm3_moe_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t down_offset, uint32_t down_type,
+        uint32_t n_total_expert, uint32_t n_slots, uint32_t ff_dim, uint32_t out_dim);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,

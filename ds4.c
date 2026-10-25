@@ -60798,7 +60798,8 @@ static int generate_qwen4_metal_argmax(
  * loads the missing experts and runs the unchanged MoE kernels on the pool:
  *  - decode rows: the selected ids are rewritten to pool slots;
  *  - prefill chunks: the grouped kernels index experts 0..127 directly, so the
- *    chunk's experts are gathered into a layer buffer in natural order.
+ *    chunk's experts are gathered in natural order into the pool's last 128
+ *    slots (the layer region), which decode uses as ordinary slots.
  * Pool slots are evicted least recently used, never from the current layer. */
 enum { MM3_EXPERTS = 128 };              /* checked against the GGUF at create */
 
@@ -60807,8 +60808,8 @@ typedef struct mm3_stream {
     uint32_t n_slots;
     uint64_t gate_bytes, down_bytes;        /* one expert: gate (= up) and down */
     uint64_t file_off[DS4_MAX_LAYER][3];    /* gate, up, down tensors in the GGUF */
-    uint8_t *pool, *layer;                  /* [gate][up][down] parts */
-    uint64_t pool_bytes, layer_bytes;
+    uint8_t *pool;                          /* [gate][up][down] parts of n_slots experts */
+    uint64_t pool_bytes;
     int32_t *slot;                          /* [layer * N_EXPERT + e] -> slot, -1 */
     uint32_t *owner;                        /* slot -> layer * N_EXPERT + e */
     uint64_t *stamp;                        /* slot -> last use */
@@ -60816,6 +60817,7 @@ typedef struct mm3_stream {
     uint64_t clock;
     uint64_t hits, misses, read_bytes;
     double read_ms;
+    struct mm3_prefetch *pf;
 } mm3_stream;
 
 typedef struct {
@@ -60830,15 +60832,23 @@ typedef struct {
     volatile int failed;
 } mm3_stream_batch;
 
+/* Reads go out in chunks so a layer missing one or two experts still keeps
+ * the SSD queue deep; job i of a batch is chunks i * MM3_READ_SPLIT.. */
+enum { MM3_READ_SPLIT = 8 };
+
 static void mm3_stream_job_run(void *ctx, size_t i) {
     mm3_stream_batch *b = ctx;
-    const mm3_stream_job *j = &b->jobs[i];
+    const mm3_stream_job *j = &b->jobs[i / MM3_READ_SPLIT];
+    /* the last chunk takes the remainder */
+    const uint64_t c = i % MM3_READ_SPLIT, chunk = (j->bytes + MM3_READ_SPLIT - 1) / MM3_READ_SPLIT;
+    const uint64_t beg = c * chunk, end = c + 1 == MM3_READ_SPLIT ? j->bytes : (c + 1) * chunk;
+    if (beg >= j->bytes) return;
     if (j->src) {
-        memcpy(j->dst, j->src, (size_t)j->bytes);
+        memcpy(j->dst + beg, j->src + beg, (size_t)(end - beg));
         return;
     }
-    for (uint64_t done = 0; done < j->bytes;) {
-        const ssize_t r = pread(b->fd, j->dst + done, (size_t)(j->bytes - done), (off_t)(j->file_off + done));
+    for (uint64_t done = beg; done < end;) {
+        const ssize_t r = pread(b->fd, j->dst + done, (size_t)(end - done), (off_t)(j->file_off + done));
         if (r > 0) done += (uint64_t)r;
         else if (r < 0 && errno == EINTR) continue;
         else { b->failed = 1; return; }
@@ -60848,13 +60858,71 @@ static void mm3_stream_job_run(void *ctx, size_t i) {
 static bool mm3_stream_run(mm3_stream *s, const mm3_stream_job *jobs, size_t n) {
     if (n == 0) return true;
     mm3_stream_batch b = { s->fd, jobs, 0 };
-    dispatch_apply_f(n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &b, mm3_stream_job_run);
+    dispatch_apply_f(n * MM3_READ_SPLIT, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &b,
+                     mm3_stream_job_run);
     if (b.failed) fprintf(stderr, "ds4: MiniMax expert read failed: %s\n", strerror(errno));
     return !b.failed;
 }
 
+/* Decode prefetch: after layer il's reads, the experts that layer il + 1's
+ * router picks on the current residual (a cheap, usually right guess) are
+ * read in the background while the GPU finishes il and runs il + 1's
+ * attention.  Their slots are claimed up front; the next plan waits for the
+ * reads and simply forgets the slots of a failed read. */
+typedef struct mm3_prefetch {
+    dispatch_group_t group;
+    mm3_stream_batch batch;
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj;
+    uint32_t keys[MM3_EXPERTS], n_keys;      /* layer * N_EXPERT + e being read */
+    bool pending;
+    uint8_t *fresh;                          /* slot -> 1 prefetched, not used yet; 2 still reading */
+    uint64_t issued, used;
+    double wait_ms;                          /* decode time spent waiting on prefetch */
+} mm3_prefetch;
+
+static void mm3_stream_prefetch_run(void *ctx) {
+    mm3_prefetch *pf = ctx;
+    dispatch_apply_f(pf->nj * MM3_READ_SPLIT, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &pf->batch,
+                     mm3_stream_job_run);
+}
+
+/* False when the reads failed: their slots are forgotten, so experts a plan
+ * already counted as arriving are not there. */
+static bool mm3_stream_prefetch_wait(mm3_stream *s) {
+    mm3_prefetch *pf = s->pf;
+    if (!pf || !pf->pending) return true;
+    const double t0 = now_sec();
+    dispatch_group_wait(pf->group, DISPATCH_TIME_FOREVER);
+    pf->wait_ms += (now_sec() - t0) * 1000.0;
+    pf->pending = false;
+    const bool failed = pf->batch.failed;
+    if (failed) fprintf(stderr, "ds4: MiniMax expert prefetch read failed\n");
+    for (uint32_t i = 0; i < pf->n_keys; i++) {
+        const int32_t slot = s->slot[pf->keys[i]];
+        if (slot < 0) continue;
+        if (!failed) {
+            if (pf->fresh[slot] == 2) pf->fresh[slot] = 1;
+            continue;
+        }
+        s->owner[slot] = UINT32_MAX;
+        pf->fresh[slot] = 0;
+        s->slot[pf->keys[i]] = -1;
+    }
+    return !failed;
+}
+
 static void mm3_stream_free(mm3_stream *s) {
     if (!s) return;
+    if (s->pf) {
+        mm3_stream_prefetch_wait(s);
+        if (s->pf->issued)
+            fprintf(stderr, "ds4: MiniMax expert prefetch: %llu read, %llu used, waited %.1f ms\n",
+                    (unsigned long long)s->pf->issued, (unsigned long long)s->pf->used, s->pf->wait_ms);
+        dispatch_release(s->pf->group);
+        free(s->pf->fresh);
+        free(s->pf);
+    }
     if (s->hits + s->misses) {
         fprintf(stderr, "ds4: MiniMax expert cache: %llu hits, %llu misses (%.1f%% hit), "
                 "read %.2f GiB at %.2f GiB/s\n",
@@ -60864,7 +60932,6 @@ static void mm3_stream_free(mm3_stream *s) {
                 s->read_ms > 0.0 ? (double)s->read_bytes / 1073741824.0 / (s->read_ms / 1000.0) : 0.0);
     }
     if (s->pool) { ds4_gpu_remove_host_map(s->pool); munmap(s->pool, (size_t)s->pool_bytes); }
-    if (s->layer) { ds4_gpu_remove_host_map(s->layer); munmap(s->layer, (size_t)s->layer_bytes); }
     if (s->fd >= 0) close(s->fd);
     free(s->slot);
     free(s->owner);
@@ -60906,7 +60973,8 @@ static mm3_stream *mm3_stream_create(const ds4_model *m, const ds4_weights *w, c
         s->file_off[il][1] = l->ffn_up_exps->abs_offset;
         s->file_off[il][2] = l->ffn_down_exps->abs_offset;
     }
-    /* A prefill chunk can touch every expert of a layer at once. */
+    /* A prefill chunk can touch every expert of a layer at once: the layer
+     * region adds one layer's worth of slots on top of the cached ones. */
     const uint32_t max_slots = (DS4_N_LAYER - DS4_N_LEADING_DENSE) * DS4_N_EXPERT;
     if (n_slots > max_slots) n_slots = max_slots;
     if (n_slots < DS4_N_EXPERT) {
@@ -60915,11 +60983,11 @@ static mm3_stream *mm3_stream_create(const ds4_model *m, const ds4_weights *w, c
         mm3_stream_free(s);
         return NULL;
     }
+    n_slots += DS4_N_EXPERT;
     s->n_slots = n_slots;
     const uint64_t expert_bytes = 2u * s->gate_bytes + s->down_bytes;
     const uint64_t page = (uint64_t)getpagesize();
     s->pool_bytes = ((uint64_t)n_slots * expert_bytes + page - 1u) / page * page;
-    s->layer_bytes = ((uint64_t)DS4_N_EXPERT * expert_bytes + page - 1u) / page * page;
     s->fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat a, b;
     if (s->fd < 0 || fstat(s->fd, &a) || fstat(m->fd, &b) || a.st_dev != b.st_dev || a.st_ino != b.st_ino ||
@@ -60929,23 +60997,31 @@ static mm3_stream *mm3_stream_create(const ds4_model *m, const ds4_weights *w, c
         return NULL;
     }
     s->pool = mm3_stream_host_alloc(s->pool_bytes, (uint64_t)n_slots * s->down_bytes);
-    s->layer = s->pool ? mm3_stream_host_alloc(s->layer_bytes, (uint64_t)DS4_N_EXPERT * s->down_bytes) : NULL;
     s->slot = malloc((size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(s->slot[0]));
     s->owner = malloc((size_t)n_slots * sizeof(s->owner[0]));
     s->stamp = calloc(n_slots, sizeof(s->stamp[0]));
-    if (!s->pool || !s->layer || !s->slot || !s->owner || !s->stamp) {
+    if (!s->pool || !s->slot || !s->owner || !s->stamp) {
         fprintf(stderr, "ds4: MiniMax SSD streaming could not allocate a %.2f GiB expert pool\n",
                 (double)s->pool_bytes / 1073741824.0);
         mm3_stream_free(s);
         return NULL;
     }
+    s->pf = calloc(1, sizeof(*s->pf));
+    if (s->pf) {
+        s->pf->fresh = calloc(n_slots, 1);
+        s->pf->group = dispatch_group_create();
+        if (!s->pf->fresh || !s->pf->group) {
+            free(s->pf->fresh);
+            free(s->pf);
+            s->pf = NULL;
+        }
+    }
     for (uint32_t i = 0; i < DS4_N_LAYER * DS4_N_EXPERT; i++) s->slot[i] = -1;
     for (uint32_t i = 0; i < n_slots; i++) s->owner[i] = UINT32_MAX;
     fprintf(stderr, "ds4: MiniMax SSD streaming: %u cached experts (%.2f GiB of %.2f GiB routed), "
-            "prefill layer buffer %.2f GiB\n",
+            "the last %u of them the prefill layer region\n",
             n_slots, (double)s->pool_bytes / 1073741824.0,
-            (double)max_slots * (double)expert_bytes / 1073741824.0,
-            (double)s->layer_bytes / 1073741824.0);
+            (double)max_slots * (double)expert_bytes / 1073741824.0, DS4_N_EXPERT);
     return s;
 }
 
@@ -60958,7 +61034,18 @@ static uint32_t mm3_stream_victim(mm3_stream *s) {
     return best;
 }
 
-enum { MM3_HIT = 0, MM3_READ_POOL = 1, MM3_READ_LAYER = 2 };
+enum { MM3_HIT = 0, MM3_READ_POOL = 1, MM3_READ_LAYER = 2, MM3_ARRIVING = 3 };
+
+/* Part p (0 gate, 1 up, 2 down) of pool slot `slot`. */
+static uint64_t mm3_part_off(const mm3_stream *s, uint32_t p, uint32_t slot) {
+    const uint64_t part_bytes = p == 2 ? s->down_bytes : s->gate_bytes;
+    return (uint64_t)p * s->n_slots * s->gate_bytes + (uint64_t)slot * part_bytes;
+}
+
+/* First slot of the layer region: prefill gathers expert e into slot first + e. */
+static uint32_t mm3_layer_region(const mm3_stream *s) {
+    return s->n_slots - DS4_N_EXPERT;
+}
 
 /* Plan layer il's experts named in ids[0..n): stamp the hits, give each miss
  * a pool slot (decode: least recently used, never this layer's) or, for
@@ -60967,7 +61054,7 @@ enum { MM3_HIT = 0, MM3_READ_POOL = 1, MM3_READ_LAYER = 2 };
  * cycle larger than the pool that LRU would turn into all misses, so prefill
  * never evicts. */
 static bool mm3_stream_plan(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather,
-                            uint32_t *uniq, uint32_t *nu_out, uint8_t *state,
+                            bool overlap, uint32_t *uniq, uint32_t *nu_out, uint8_t *state,
                             mm3_stream_job *jobs, size_t *nj_out) {
     uint32_t nu = 0;
     bool seen[MM3_EXPERTS] = {0};
@@ -60978,40 +61065,93 @@ static bool mm3_stream_plan(mm3_stream *s, uint32_t il, const int32_t *ids, uint
         }
         if (!seen[ids[i]]) { seen[ids[i]] = true; uniq[nu++] = (uint32_t)ids[i]; }
     }
+    /* overlap: a prefetch may still be reading; its experts come back as
+     * MM3_ARRIVING and the caller waits for it before using them */
+    if (!overlap) mm3_stream_prefetch_wait(s);
+    if (gather) {
+        /* hand the layer region back from the cache */
+        for (uint32_t slot = mm3_layer_region(s); slot < s->n_slots; slot++) {
+            if (s->owner[slot] == UINT32_MAX) continue;
+            s->slot[s->owner[slot]] = -1;
+            s->owner[slot] = UINT32_MAX;
+            if (s->pf) s->pf->fresh[slot] = 0;
+        }
+    }
     int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
     s->clock++;
     /* stamp the hits first so no victim below is one of this layer's experts */
     for (uint32_t i = 0; i < nu; i++) {
         state[uniq[i]] = MM3_HIT;
-        if (row[uniq[i]] >= 0) { s->stamp[row[uniq[i]]] = s->clock; s->hits++; }
+        const int32_t slot = row[uniq[i]];
+        if (slot < 0) continue;
+        s->stamp[slot] = s->clock;
+        s->hits++;
+        if (s->pf && s->pf->fresh[slot]) {
+            if (s->pf->fresh[slot] == 2) state[uniq[i]] = MM3_ARRIVING;
+            s->pf->fresh[slot] = 0;
+            s->pf->used++;
+        }
     }
     const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
-    const uint64_t pool_part[3] = { 0, (uint64_t)s->n_slots * s->gate_bytes, 2u * (uint64_t)s->n_slots * s->gate_bytes };
-    const uint64_t layer_part[3] = { 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes, 2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes };
     size_t nj = 0;
     for (uint32_t i = 0; i < nu; i++) {
         const uint32_t e = uniq[i];
         if (row[e] >= 0) continue;
         s->misses++;
-        const uint32_t slot = gather ? (s->n_used < s->n_slots ? s->n_used++ : UINT32_MAX) : mm3_stream_victim(s);
+        const uint32_t slot = !gather ? mm3_stream_victim(s) :
+                              s->n_used < mm3_layer_region(s) ? s->n_used++ : UINT32_MAX;
         if (slot == UINT32_MAX && !gather) return false;
         state[e] = slot == UINT32_MAX ? MM3_READ_LAYER : MM3_READ_POOL;
         if (slot != UINT32_MAX) {
             if (s->owner[slot] != UINT32_MAX) s->slot[s->owner[slot]] = -1;
+            if (s->pf) s->pf->fresh[slot] = 0;
             s->owner[slot] = il * DS4_N_EXPERT + e;
             s->stamp[slot] = s->clock;
             row[e] = (int32_t)slot;
         }
+        const uint32_t dst = slot == UINT32_MAX ? mm3_layer_region(s) + e : slot;
         for (uint32_t p = 0; p < 3; p++) {
-            uint8_t *dst = slot == UINT32_MAX ? s->layer + layer_part[p] + (uint64_t)e * part_bytes[p]
-                                              : s->pool + pool_part[p] + (uint64_t)slot * part_bytes[p];
-            jobs[nj++] = (mm3_stream_job){ dst, NULL, s->file_off[il][p] + (uint64_t)e * part_bytes[p], part_bytes[p] };
+            jobs[nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, dst), NULL,
+                                           s->file_off[il][p] + (uint64_t)e * part_bytes[p], part_bytes[p] };
             s->read_bytes += part_bytes[p];
         }
     }
     *nu_out = nu;
     *nj_out = nj;
     return true;
+}
+
+/* Claim least-recently-used slots (never this layer's) for layer il's
+ * guessed experts that are not pooled, and start reading them. */
+static void mm3_stream_prefetch(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n) {
+    mm3_prefetch *pf = s->pf;
+    if (!pf || pf->pending || il >= DS4_N_LAYER) return;
+    int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    pf->nj = 0;
+    pf->n_keys = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= (int32_t)DS4_N_EXPERT || row[ids[i]] >= 0) continue;
+        const uint32_t slot = mm3_stream_victim(s);
+        if (slot == UINT32_MAX) break;
+        if (s->owner[slot] != UINT32_MAX) s->slot[s->owner[slot]] = -1;
+        s->owner[slot] = il * DS4_N_EXPERT + (uint32_t)ids[i];
+        s->stamp[slot] = s->clock + 1;   /* the next layer's plan must not evict it mid-read */
+        row[ids[i]] = (int32_t)slot;
+        pf->fresh[slot] = 2;
+        pf->keys[pf->n_keys++] = il * DS4_N_EXPERT + (uint32_t)ids[i];
+        for (uint32_t p = 0; p < 3; p++) {
+            pf->jobs[pf->nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, slot), NULL,
+                                                   s->file_off[il][p] + (uint64_t)ids[i] * part_bytes[p], part_bytes[p] };
+            s->read_bytes += part_bytes[p];
+        }
+        pf->issued++;
+    }
+    if (pf->nj == 0) return;
+    pf->batch = (mm3_stream_batch){ s->fd, pf->jobs, 0 };
+    pf->pending = true;
+    dispatch_group_async_f(pf->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), pf,
+                           mm3_stream_prefetch_run);
 }
 
 /* Run the planned reads; on failure forget the slots they were filling. */
@@ -61032,29 +61172,26 @@ static bool mm3_stream_read(mm3_stream *s, uint32_t il, const uint32_t *uniq, ui
 }
 
 /* Make layer il's experts available: in the pool for decode and, for prefill,
- * gathered into the layer buffer at their own index. */
+ * gathered into the layer region at their own index. */
 static bool mm3_stream_load(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather) {
     uint32_t uniq[MM3_EXPERTS], nu = 0;
     uint8_t state[MM3_EXPERTS];
     mm3_stream_job jobs[3 * MM3_EXPERTS];
     size_t nj = 0;
-    if (!mm3_stream_plan(s, il, ids, n, gather, uniq, &nu, state, jobs, &nj) ||
+    if (!mm3_stream_plan(s, il, ids, n, gather, false, uniq, &nu, state, jobs, &nj) ||
         !mm3_stream_read(s, il, uniq, nu, state, jobs, nj)) {
         return false;
     }
     if (!gather) return true;
     const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
-    const uint64_t pool_part[3] = { 0, (uint64_t)s->n_slots * s->gate_bytes, 2u * (uint64_t)s->n_slots * s->gate_bytes };
-    const uint64_t layer_part[3] = { 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes, 2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes };
     const int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
     nj = 0;
     for (uint32_t i = 0; i < nu; i++) {
         const uint32_t e = uniq[i];
         if (state[e] == MM3_READ_LAYER) continue;
         for (uint32_t p = 0; p < 3; p++) {
-            jobs[nj++] = (mm3_stream_job){ s->layer + layer_part[p] + (uint64_t)e * part_bytes[p],
-                                           s->pool + pool_part[p] + (uint64_t)row[e] * part_bytes[p],
-                                           0, part_bytes[p] };
+            jobs[nj++] = (mm3_stream_job){ s->pool + mm3_part_off(s, p, mm3_layer_region(s) + e),
+                                           s->pool + mm3_part_off(s, p, (uint32_t)row[e]), 0, part_bytes[p] };
         }
     }
     return mm3_stream_run(s, jobs, nj);
@@ -61080,6 +61217,9 @@ typedef struct {
     ds4_gpu_tensor *ff_gate, *ff_up, *ff_mid;
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *lists, *counts;
     ds4_gpu_tensor *sh_out;
+    ds4_gpu_tensor *slots;   /* one-token pool slot ids, written only by the CPU */  /* one-token routed gate/up, apart from the shared expert's */
+    ds4_gpu_tensor *attn_part;   /* split decode attention partials */
+    ds4_gpu_tensor *pred_xn, *pred_logits, *pred_sel, *pred_w;   /* next layer's router guess */
     ds4_gpu_tensor *logits;
     float *host_rows;
     float rope_freq[32];
@@ -61097,7 +61237,7 @@ static void mm3_graph_free(ds4_mm3_graph *g) {
     ds4_gpu_tensor *all[] = {
         g->x, g->xn, g->blk, g->qp, g->kp, g->vp, g->iqp, g->ikp, g->q, g->iq, g->attn_o, g->score, g->sel,
         g->ff_gate, g->ff_up, g->ff_mid, g->router, g->selected, g->weights, g->mid, g->part, g->lists,
-        g->counts, g->sh_out, g->logits,
+        g->counts, g->sh_out, g->slots, g->attn_part, g->pred_xn, g->pred_logits, g->pred_sel, g->pred_w, g->logits,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) ds4_gpu_tensor_free(all[i]);
     free(g->host_rows);
@@ -61107,6 +61247,11 @@ static void mm3_graph_free(ds4_mm3_graph *g) {
 /* Decode rows at or below this count run experts per (token, slot) with the
  * shared expert as an extra slot; larger chunks use the expert-grouped GEMMs. */
 #define MM3_MOE_MM_MIN 64u
+/* Rows at or below this count split attention over the block list. */
+#define MM3_ATTN_SPLIT_MAX 4u
+/* Prefetch only the guess's top experts (router order): its 4th pick is
+ * wrong often enough that reading it costs more than it saves. */
+#define MM3_GUESS 3u
 
 static bool mm3_graph_alloc(ds4_mm3_graph *g, uint32_t ctx_cap, uint32_t cap_tokens) {
     memset(g, 0, sizeof(*g));
@@ -61155,6 +61300,12 @@ static bool mm3_graph_alloc(ds4_mm3_graph *g, uint32_t ctx_cap, uint32_t cap_tok
     MM3_ALLOC(lists, (uint64_t)DS4_N_EXPERT * T * 4u);
     MM3_ALLOC(counts, (uint64_t)DS4_N_EXPERT * 4u);
     MM3_ALLOC(sh_out, T * E * 4u);
+    MM3_ALLOC(slots, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(pred_xn, E * 4u);
+    MM3_ALLOC(pred_logits, (uint64_t)DS4_N_EXPERT * 4u);
+    MM3_ALLOC(pred_sel, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(pred_w, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    MM3_ALLOC(attn_part, (uint64_t)MM3_ATTN_SPLIT_MAX * DS4_N_HEAD * DS4_N_INDEXER_TOP_K * 132u * 4u);
     MM3_ALLOC(logits, (uint64_t)DS4_N_VOCAB * 4u);
 #undef MM3_ALLOC
     if (ok) {
@@ -61173,13 +61324,19 @@ static bool mm3_graph_alloc(ds4_mm3_graph *g, uint32_t ctx_cap, uint32_t cap_tok
 static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                 uint32_t il, uint32_t pos0, uint32_t T) {
     const uint32_t E = DS4_N_EMBD;
-    return ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->attn_norm->abs_offset,
-                                               E, T, DS4_RMS_EPS) &&
-           qwen4_gemv(g->qp, m, l->attn_q, g->xn, T) &&
-           qwen4_gemv(g->kp, m, l->attn_k, g->xn, T) &&
-           qwen4_gemv(g->vp, m, l->attn_v, g->xn, T) &&
-           qwen4_gemv(g->iqp, m, l->indexer_q_proj, g->xn, T) &&
-           qwen4_gemv(g->ikp, m, l->indexer_k_proj, g->xn, T) &&
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->attn_norm->abs_offset,
+                                             E, T, DS4_RMS_EPS)) {
+        return false;
+    }
+    /* the five projections of xn are independent: one concurrent section */
+    const bool conc = ds4_gpu_concurrent_begin() != 0;
+    const bool proj = qwen4_gemv(g->qp, m, l->attn_q, g->xn, T) &&
+                      qwen4_gemv(g->kp, m, l->attn_k, g->xn, T) &&
+                      qwen4_gemv(g->vp, m, l->attn_v, g->xn, T) &&
+                      qwen4_gemv(g->iqp, m, l->indexer_q_proj, g->xn, T) &&
+                      qwen4_gemv(g->ikp, m, l->indexer_k_proj, g->xn, T);
+    if (conc) ds4_gpu_concurrent_end();
+    return proj &&
            ds4_gpu_mm3_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->iq, g->ik_cache[il],
                                         g->qp, g->kp, g->vp, g->iqp, g->ikp, m->map, m->size,
                                         l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
@@ -61188,7 +61345,8 @@ static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_
                                         g->rope_freq, DS4_RMS_EPS) &&
            ds4_gpu_mm3_idx_select_tensor(g->sel, g->score, g->iq, g->ik_cache[il], T, pos0,
                                          DS4_N_INDEXER_HEAD, DS4_N_SWA, DS4_N_INDEXER_TOP_K, g->score_stride) &&
-           ds4_gpu_mm3_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], g->sel, T,
+           ds4_gpu_mm3_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], g->sel,
+                                   T <= MM3_ATTN_SPLIT_MAX ? g->attn_part : NULL, T,
                                    DS4_N_HEAD, DS4_N_HEAD_KV, pos0, DS4_N_SWA, DS4_N_INDEXER_TOP_K,
                                    1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
            qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T) &&
@@ -61208,8 +61366,9 @@ static bool mm3_graph_stream_experts(ds4_mm3_graph *g, uint32_t il, uint32_t T, 
     int32_t *ids = ds4_gpu_tensor_contents(g->selected);
     if (!ids || !mm3_stream_load(s, il, ids, n, gather)) return false;
     if (gather) {
-        *x = (mm3_experts){ s->layer, s->layer_bytes, 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes,
-                            2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes, DS4_N_EXPERT };
+        const uint32_t r = mm3_layer_region(s);
+        *x = (mm3_experts){ s->pool, s->pool_bytes, mm3_part_off(s, 0, r), mm3_part_off(s, 1, r),
+                            mm3_part_off(s, 2, r), DS4_N_EXPERT };
     } else {
         for (uint32_t i = 0; i < n; i++) ids[i] = s->slot[(uint64_t)il * DS4_N_EXPERT + (uint32_t)ids[i]];
         *x = (mm3_experts){ s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
@@ -61218,18 +61377,21 @@ static bool mm3_graph_stream_experts(ds4_mm3_graph *g, uint32_t il, uint32_t T, 
     return glm_graph_begin_commands_if_needed();
 }
 
-/* Routed slots [s0, s0 + ns) of a one-token decode, reading the pool. */
-static bool mm3_graph_routed_slots(ds4_mm3_graph *g, const ds4_layer_weights *l, const mm3_experts *x,
-                                   uint32_t s0, uint32_t ns) {
+/* Stage (0 gate/up with SwiGLU, 1 down) of a one-token decode's routed
+ * slots [s0, s0 + ns), reading the pool. */
+static bool mm3_graph_routed_stage(ds4_mm3_graph *g, const ds4_layer_weights *l, const mm3_experts *x,
+                                   uint32_t stage, uint32_t s0, uint32_t ns) {
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
-    ds4_gpu_tensor *sel = ds4_gpu_tensor_view(g->selected, (uint64_t)s0 * 4u, (uint64_t)ns * 4u);
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_view(g->slots, (uint64_t)s0 * 4u, (uint64_t)ns * 4u);
     ds4_gpu_tensor *mid = ds4_gpu_tensor_view(g->mid, (uint64_t)s0 * F * 4u, (uint64_t)ns * F * 4u);
     ds4_gpu_tensor *part = ds4_gpu_tensor_view(g->part, (uint64_t)s0 * E * 4u, (uint64_t)ns * E * 4u);
-    const bool ok = sel && mid && part &&
-        ds4_gpu_qwen4_moe_mid_tensor(mid, g->xn, sel, x->map, x->size, x->gate, x->up,
-                                     l->ffn_gate_exps->type, x->n_total, 1, ns, E, F, 0, 0, UINT32_MAX) &&
-        ds4_gpu_qwen4_moe_down_tensor(part, mid, sel, x->map, x->size, x->down,
-                                      l->ffn_down_exps->type, x->n_total, 1, ns, F, E, 0, UINT32_MAX);
+    bool ok = sel && mid && part;
+    if (ok && stage == 0)
+        ok = ds4_gpu_mm3_moe_gate_up_tensor(mid, g->xn, sel, x->map, x->size, x->gate, x->up,
+                                            l->ffn_gate_exps->type, x->n_total, ns, E, F) != 0;
+    if (ok && stage == 1)
+        ok = ds4_gpu_mm3_moe_down_tensor(part, mid, sel, x->map, x->size, x->down, l->ffn_down_exps->type,
+                                         x->n_total, ns, F, E) != 0;
     ds4_gpu_tensor_free(sel);
     ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(part);
@@ -61240,18 +61402,31 @@ static bool mm3_graph_routed_slots(ds4_mm3_graph *g, const ds4_layer_weights *l,
  * expert and the slots whose experts are already pooled are committed first,
  * the missing experts are read while they run, then the remaining slots and
  * the reduce follow.  Slots stay in router order, so the reduce sums exactly
- * as the unsplit path does. */
+ * as the unsplit path does.  Each pass runs its expert chains side by side in
+ * one concurrent section, stage by stage. */
 static bool mm3_graph_stream_decode_moe(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                         uint32_t il) {
     mm3_stream *s = g->stream;
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
-    if (!ds4_gpu_end_commands()) return false;
-    int32_t *ids = ds4_gpu_tensor_contents(g->selected);
+    /* The router's buffer may still hold a dirty GPU line until its command
+     * buffer completes, so the pool slots go to a buffer only the CPU writes. */
+    int32_t routed[2 * DS4_MAX_EXPERT_USED];   /* this layer's ids, then the next layer's guess */
+    /* the shared expert needs no routing: it runs while the CPU plans */
+    if (!ds4_gpu_mm3_publish(g->selected, g->pred_sel, U) ||
+        !qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, 1) ||
+        !qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, 1) ||
+        !ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, F) ||
+        !qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, 1) ||
+        !ds4_gpu_mm3_publish_wait(U, routed)) {
+        return false;
+    }
+    int32_t *ids = ds4_gpu_tensor_contents(g->slots);
+    if (ids) memcpy(ids, routed, U * sizeof(ids[0]));
     uint32_t uniq[MM3_EXPERTS], nu = 0;
     uint8_t state[MM3_EXPERTS];
     mm3_stream_job jobs[3 * MM3_EXPERTS];
     size_t nj = 0;
-    if (!ids || !mm3_stream_plan(s, il, ids, U, false, uniq, &nu, state, jobs, &nj)) return false;
+    if (!ids || !mm3_stream_plan(s, il, ids, U, false, true, uniq, &nu, state, jobs, &nj)) return false;
     bool missing[MM3_EXPERTS] = {0};   /* by slot: expert still being read */
     for (uint32_t i = 0; i < U; i++) {
         missing[i] = state[ids[i]] != MM3_HIT;
@@ -61259,30 +61434,65 @@ static bool mm3_graph_stream_decode_moe(ds4_mm3_graph *g, const ds4_model *m, co
     }
     const mm3_experts x = { s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
                             2u * (uint64_t)s->n_slots * s->gate_bytes, s->n_slots };
-    bool ok = glm_graph_begin_commands_if_needed() &&
-              qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, 1) &&
-              qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, 1) &&
-              ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, F) &&
-              qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, 1);
+    bool ok = glm_graph_begin_commands_if_needed();
     for (uint32_t pass = 0; pass < 2 && ok; pass++) {
-        /* contiguous runs of ready (pass 0) or just-read (pass 1) slots */
-        for (uint32_t s0 = 0; s0 < U && ok;) {
-            if (missing[s0] != (pass == 1)) { s0++; continue; }
-            uint32_t s1 = s0 + 1;
-            while (s1 < U && missing[s1] == (pass == 1)) s1++;
-            ok = mm3_graph_routed_slots(g, l, &x, s0, s1 - s0);
-            s0 = s1;
+        const bool conc = ds4_gpu_concurrent_begin() != 0;
+        for (uint32_t stage = 0; stage < 2 && ok; stage++) {
+            /* contiguous runs of ready (pass 0) or just-read (pass 1) slots */
+            for (uint32_t s0 = 0; s0 < U && ok;) {
+                if (missing[s0] != (pass == 1)) { s0++; continue; }
+                uint32_t s1 = s0 + 1;
+                while (s1 < U && missing[s1] == (pass == 1)) s1++;
+                ok = mm3_graph_routed_stage(g, l, &x, stage, s0, s1 - s0);
+                s0 = s1;
+            }
+            if (conc && stage == 0) ds4_gpu_concurrent_barrier();
         }
-        if (pass == 0 && ok && nj != 0) {
-            ok = ds4_gpu_flush_commands() != 0 && mm3_stream_read(s, il, uniq, nu, state, jobs, nj);
+        if (conc) ds4_gpu_concurrent_end();
+        if (pass != 0 || !ok) continue;
+        bool any_missing = false;
+        for (uint32_t i = 0; i < U; i++) any_missing |= missing[i];
+        if (any_missing) ok = ds4_gpu_flush_commands() != 0;
+        /* this layer's reads run beside the tail of the previous prefetch */
+        if (ok && nj != 0) ok = mm3_stream_read(s, il, uniq, nu, state, jobs, nj);
+        if (ok) ok = mm3_stream_prefetch_wait(s);
+        if (ok && il + 1u < DS4_N_LAYER) {
+            mm3_stream_prefetch(s, il + 1u, routed + U, MM3_GUESS);
         }
     }
     return ok && ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, 1, U, U, E, 2u);
 }
 
+/* One-token streamed decode: the router of il and the guess for il + 1's
+ * prefetch (the next router on this residual) as two chains side by side in
+ * a concurrent section, then the streamed MoE. */
+static bool mm3_graph_stream_decode_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t il) {
+    const uint32_t E = DS4_N_EMBD, U = DS4_N_EXPERT_USED;
+    const ds4_layer_weights *ln = il + 1u < DS4_N_LAYER ? l + 1 : NULL;
+    const bool conc = ds4_gpu_concurrent_begin() != 0;
+    bool ok = ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->ffn_norm->abs_offset,
+                                                  E, 1, DS4_RMS_EPS) &&
+              (!ln || ds4_gpu_rms_norm_weight_rows_tensor(g->pred_xn, g->x, m->map, m->size,
+                                                          ln->ffn_norm->abs_offset, E, 1, DS4_RMS_EPS));
+    if (conc) ds4_gpu_concurrent_barrier();
+    ok = ok && qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, 1) &&
+         (!ln || qwen4_gemv(g->pred_logits, m, ln->ffn_gate_inp, g->pred_xn, 1));
+    if (conc) ds4_gpu_concurrent_barrier();
+    ok = ok && ds4_gpu_mm3_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
+                                         l->ffn_exp_probs_b->abs_offset, 1, DS4_N_EXPERT, U,
+                                         DS4_EXPERT_WEIGHT_SCALE) &&
+         (!ln || ds4_gpu_mm3_router_tensor(g->pred_sel, g->pred_w, g->pred_logits, m->map, m->size,
+                                           ln->ffn_exp_probs_b->abs_offset, 1, DS4_N_EXPERT, U,
+                                           DS4_EXPERT_WEIGHT_SCALE));
+    if (conc) ds4_gpu_concurrent_end();
+    return ok && mm3_graph_stream_decode_moe(g, m, l, il);
+}
+
 static bool mm3_graph_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                           uint32_t il, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
+    if (g->stream && T == 1 && il >= DS4_N_LEADING_DENSE) return mm3_graph_stream_decode_ffn(g, m, l, il);
     if (!ds4_gpu_rms_norm_weight_rows_tensor(g->xn, g->x, m->map, m->size, l->ffn_norm->abs_offset,
                                              E, T, DS4_RMS_EPS)) {
         return false;
@@ -61300,7 +61510,6 @@ static bool mm3_graph_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_
                                    DS4_EXPERT_WEIGHT_SCALE)) {
         return false;
     }
-    if (g->stream && T == 1) return mm3_graph_stream_decode_moe(g, m, l, il);
     const bool mm = T > MM3_MOE_MM_MIN;
     mm3_experts x = { m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                       l->ffn_down_exps->abs_offset, DS4_N_EXPERT };
@@ -73934,7 +74143,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
             if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
-                spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
+                /* MiniMax embeds on the CPU: its token table stays out of the GPU map */
+                spans_ok = weights_model_map_decode_static_spans(&e->weights, !ds4_model_is_minimax3(),
+                                                                 true, &spans);
             } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
                     spans_ok = weights_model_map_decode_runtime_slice_spans(
@@ -74120,9 +74331,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #ifdef DS4_HAS_QWEN4_METAL
         if (e->ssd_streaming && ds4_model_is_minimax3()) {
-            /* the prefill layer buffer comes out of the planned prefill headroom */
+            /* The planner reserves two layers of prefill headroom; one becomes
+             * the pool's layer region, the other more cached experts, as does
+             * the token table the planner counted but the GPU never maps. */
+            const ds4_layer_weights *l0 = &e->weights.layer[DS4_N_LEADING_DENSE];
+            const uint64_t expert_bytes = (l0->ffn_gate_exps->bytes + l0->ffn_up_exps->bytes +
+                                           l0->ffn_down_exps->bytes) / DS4_N_EXPERT;
+            const uint64_t spare = (e->ssd_streaming_prefill_headroom_bytes > DS4_N_EXPERT * expert_bytes ?
+                                    e->ssd_streaming_prefill_headroom_bytes - DS4_N_EXPERT * expert_bytes : 0) +
+                                   e->weights.token_embd->bytes;
             e->mm3_stream = mm3_stream_create(&e->model, &e->weights, opt->model_path,
-                                              e->ssd_streaming_cache_experts);
+                                              e->ssd_streaming_cache_experts + (uint32_t)(spare / expert_bytes));
             if (!e->mm3_stream) {
                 free(load_offsets);
                 free(load_sizes);

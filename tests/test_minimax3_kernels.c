@@ -194,7 +194,9 @@ static void test_sparse_attention(uint32_t n_keys, uint32_t T) {
     ds4_gpu_tensor *out = upload(NULL, (uint64_t)T * H * D);
     const float scale = 1.0f / sqrtf((float)D);
     require_ok(ds4_gpu_mm3_idx_select_tensor(sel, score, tiq, tik, T, pos0, HI, BLOCK, TOPK, stride), "mm3 select");
-    require_ok(ds4_gpu_mm3_attn_tensor(out, tq, tk, tv, sel, T, H, HKV, pos0, BLOCK, TOPK, scale), "mm3 attention");
+    /* decode-sized batches take the split path, as in the graph */
+    ds4_gpu_tensor *part = T <= 4 ? upload(NULL, (uint64_t)T * H * TOPK * 132) : NULL;
+    require_ok(ds4_gpu_mm3_attn_tensor(out, tq, tk, tv, sel, part, T, H, HKV, pos0, BLOCK, TOPK, scale), "mm3 attention");
     require_ok(ds4_gpu_synchronize(), "sync");
     int32_t *gsel = download_bytes(sel, (uint64_t)T * HI * TOPK * 4);
     float *gout = download_bytes(out, (uint64_t)T * H * D * 4);
@@ -262,6 +264,7 @@ static void test_sparse_attention(uint32_t n_keys, uint32_t T) {
     snprintf(name, sizeof(name), "sparse attention n_keys=%u T=%u", n_keys, T);
     check_close(name, gout, ref, (uint64_t)T * H * D, 2e-4);
     free(q); free(iq); free(ik); free(k); free(v); free(k16); free(v16); free(gsel); free(gout); free(ref);
+    ds4_gpu_tensor_free(part);
     ds4_gpu_tensor *all[] = { tq, tiq, tik, tk, tv, score, sel, out };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) ds4_gpu_tensor_free(all[i]);
 }

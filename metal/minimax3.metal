@@ -222,16 +222,19 @@ struct ds4_metal_args_mm3_attn {
     uint32_t block;
     uint32_t top_k;
     float    scale;
-    uint32_t pad0;
+    uint32_t n_split;      // 1: final output; >1: partials, see kernel_mm3_attn_combine
 };
 
 #define MM3_ATTN_CHUNK 32
+#define MM3_ATTN_PART 132  // per (token, head, split): acc[128], max, sum
 
 // Block-sparse GQA attention.  One threadgroup per (KV head, token) with one
 // simdgroup per query head of the group (16).  The token's block list is the
 // indexer selection, or every block while there are at most top_k of them.
 // K/V are staged 32 keys at a time; lane i scores key i, then every lane
-// folds the chunk into its 4 output dims with an online softmax.
+// folds the chunk into its 4 output dims with an online softmax.  Decode has
+// only Hkv threadgroups, so it splits the block list over grid z (split z
+// takes blocks z, z + n_split, ...) and kernel_mm3_attn_combine merges.
 kernel void kernel_mm3_attn(
         constant ds4_metal_args_mm3_attn & args,
         device const float   *q,        // [T][H*128]
@@ -262,7 +265,7 @@ kernel void kernel_mm3_attn(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m = -INFINITY, l = 0.0f, acc[4] = { 0, 0, 0, 0 };
-    for (uint li = 0; li < n_list; li++) {
+    for (uint li = tgpig.z; li < n_list; li += args.n_split) {
         const uint b = nb <= args.top_k ? li : (uint)list[li];
         const uint start = b * args.block;
         const uint end = min(start + args.block, pos + 1);
@@ -301,11 +304,41 @@ kernel void kernel_mm3_attn(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
-    if (sg < group) {
+    if (sg < group && args.n_split > 1) {
+        device float *o = out + (((uint64_t)tok * H + head) * args.n_split + tgpig.z) * MM3_ATTN_PART;
+        for (uint k = 0; k < 4; k++) o[lane * 4 + k] = acc[k];
+        if (lane == 0) { o[128] = m; o[129] = l; }
+    } else if (sg < group) {
         device float *o = out + ((uint64_t)tok * H + head) * 128;
         const float inv = l > 0.0f ? 1.0f / l : 0.0f;
         for (uint k = 0; k < 4; k++) o[lane * 4 + k] = acc[k] * inv;
     }
+}
+
+// out[t][h] from the n_split online-softmax partials of kernel_mm3_attn.
+// One simdgroup per (head, token); empty splits carry max -inf and sum 0.
+kernel void kernel_mm3_attn_combine(
+        constant ds4_metal_args_mm3_attn & args,
+        device const float *part,   // [T][H][n_split][MM3_ATTN_PART]
+        device float       *out,    // [T][H*128]
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = tgpig.x, tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    device const float *p = part + ((uint64_t)tok * args.n_head + head) * args.n_split * MM3_ATTN_PART;
+    float m = -INFINITY;
+    for (uint z = 0; z < args.n_split; z++) m = max(m, p[z * MM3_ATTN_PART + 128]);
+    float l = 0.0f, acc[4] = { 0, 0, 0, 0 };
+    for (uint z = 0; z < args.n_split; z++) {
+        device const float *pz = p + z * MM3_ATTN_PART;
+        if (pz[129] == 0.0f) continue;
+        const float c = exp(pz[128] - m);
+        l += pz[129] * c;
+        for (uint k = 0; k < 4; k++) acc[k] += pz[lane * 4 + k] * c;
+    }
+    device float *o = out + ((uint64_t)tok * args.n_head + head) * 128;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint k = 0; k < 4; k++) o[lane * 4 + k] = acc[k] * inv;
 }
 
 struct ds4_metal_args_mm3_router {
@@ -413,4 +446,23 @@ kernel void kernel_mm3_glu(
         uint gid [[thread_position_in_grid]]) {
     if (gid >= args.n) return;
     out[gid] = qwen4_glu(gate[gid], up[gid], 1u);
+}
+
+// Publish the decode router's choice to the CPU without waiting for the
+// command buffer: both id lists and then the sequence number go to one small
+// shared line the host polls.
+kernel void kernel_mm3_publish(
+        constant uint &seq,
+        constant uint &n,
+        device const int32_t *a,
+        device const int32_t *b,
+        device atomic_uint *line,     // [0] seq, [1..n] a, [1+n..2n] b
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    for (uint i = 0; i < n; i++) {
+        atomic_store_explicit(&line[1 + i], (uint)a[i], memory_order_relaxed);
+        atomic_store_explicit(&line[1 + n + i], (uint)b[i], memory_order_relaxed);
+    }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    atomic_store_explicit(&line[0], seq, memory_order_relaxed);
 }
