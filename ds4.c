@@ -43467,6 +43467,7 @@ struct ds4_engine {
     /* Qwen keeps the same idea in its own graph shape; the first session
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
+    struct mm3_stream *mm3_stream;     /* MiniMax SSD streaming expert pool */
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
@@ -44671,13 +44672,25 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
     if (ds4_model_is_minimax3()) {
         /* ]~b] opens every role block and [e~[ closes it; ]~!b[ (kept in
-         * sop_id) starts the document once.  Thinking uses <mm:think>; the
-         * plain <think> tokens are ordinary text to this template. */
+         * sop_id) starts the document once.  Thinking uses <mm:think>, which
+         * ds4 spells <think> so every think-aware path (server parsers and
+         * streams, CLI display) handles it unchanged.  The template never
+         * emits its plain <think> tokens; they are renamed out of the way.
+         * Token ids are untouched, so prompts stay template-exact. */
+        static const char *const rename[][2] = {
+            {"<think>", "<|minimax_unused_think|>"}, {"</think>", "<|minimax_unused_think_end|>"},
+            {"<mm:think>", "<think>"}, {"</mm:think>", "</think>"},
+        };
+        for (size_t i = 0; i < sizeof(rename) / sizeof(rename[0]); i++) {
+            const int id = vocab_lookup(vocab, rename[i][0]);
+            vocab->token[id] = (ds4_str){ rename[i][1], strlen(rename[i][1]) };
+            table_put(&vocab->token_to_id, vocab->token[id], id);
+        }
         vocab->bos_id = vocab_lookup(vocab, "]~b]");
         vocab->eos_id = vocab_lookup(vocab, "[e~[");
         vocab->sop_id = vocab_lookup(vocab, "]~!b[");
-        vocab->think_start_id = vocab_lookup(vocab, "<mm:think>");
-        vocab->think_end_id = vocab_lookup(vocab, "</mm:think>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
         vocab->system_id = vocab->user_id = vocab->assistant_id = vocab->observation_id = -1;
         vocab->tool_call_start_id = vocab->tool_call_end_id = -1;
         vocab->tool_response_start_id = vocab->tool_response_end_id = -1;
@@ -44844,15 +44857,16 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
  * fixed identity and thinking instructions, a developer block carrying the
  * caller's system prompt (or the default identity), then user/ai/tool
  * blocks, each "]~b]role\n ... [e~[\n".  Thinking is adaptive: the template
- * adds no prefix, and a disabled turn starts right after </mm:think>. */
+ * adds no prefix, and a disabled turn starts right after </mm:think>.  The
+ * think tokens are spelled <think></think> here (see vocab_load). */
 static const char *DS4_MINIMAX3_ROOT_SYSTEM =
     "Your model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. "
     "Founded in early 2022, MiniMax is a global AI foundation model company committed to "
     "advancing the frontiers of AI towards AGI."
     "\n\n<thinking_instructions>\n"
     "You have a thinking capability that allows you to reason step by step before responding. "
-    "When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your "
-    "response. When thinking is disabled, begin your response directly after the </mm:think> "
+    "When thinking is enabled, wrap your reasoning in <think></think> tags before your "
+    "response. When thinking is disabled, begin your response directly after the </think> "
     "prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n"
     "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, "
     "multi-step reasoning, or when analyzing function/tool results.\n"
@@ -45178,7 +45192,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             bpe_tokenize_text(vocab, "</response>", tokens);
         } else if (!strcmp(role, "assistant")) {
             minimax3_chat_open(vocab, "ai", tokens);
-            if (strncmp(content, "<mm:think>", 10) != 0 && strncmp(content, "</mm:think>", 11) != 0)
+            if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0)
                 token_vec_push(tokens, vocab->think_end_id);
             tokenize_rendered_chat_vocab(vocab, content, tokens);
         } else {
@@ -60777,6 +60791,282 @@ static int generate_qwen4_metal_argmax(
  * short contexts are exact dense attention.  Routed experts run through the
  * qwen4 MoE kernels with the SwiGLU-OAI activation. */
 
+/* SSD streaming of the routed experts.  Non-routed weights stay mapped from
+ * the GGUF; routed experts live in an explicit resident pool filled with
+ * pread from a page-cache-bypassing descriptor, so the file cache never
+ * competes with the pool.  Each MoE layer reads the router's choice back,
+ * loads the missing experts and runs the unchanged MoE kernels on the pool:
+ *  - decode rows: the selected ids are rewritten to pool slots;
+ *  - prefill chunks: the grouped kernels index experts 0..127 directly, so the
+ *    chunk's experts are gathered into a layer buffer in natural order.
+ * Pool slots are evicted least recently used, never from the current layer. */
+enum { MM3_EXPERTS = 128 };              /* checked against the GGUF at create */
+
+typedef struct mm3_stream {
+    int fd;
+    uint32_t n_slots;
+    uint64_t gate_bytes, down_bytes;        /* one expert: gate (= up) and down */
+    uint64_t file_off[DS4_MAX_LAYER][3];    /* gate, up, down tensors in the GGUF */
+    uint8_t *pool, *layer;                  /* [gate][up][down] parts */
+    uint64_t pool_bytes, layer_bytes;
+    int32_t *slot;                          /* [layer * N_EXPERT + e] -> slot, -1 */
+    uint32_t *owner;                        /* slot -> layer * N_EXPERT + e */
+    uint64_t *stamp;                        /* slot -> last use */
+    uint32_t n_used;
+    uint64_t clock;
+    uint64_t hits, misses, read_bytes;
+    double read_ms;
+} mm3_stream;
+
+typedef struct {
+    uint8_t *dst;
+    const uint8_t *src;                     /* NULL: pread file_off */
+    uint64_t file_off, bytes;
+} mm3_stream_job;
+
+typedef struct {
+    int fd;
+    const mm3_stream_job *jobs;
+    volatile int failed;
+} mm3_stream_batch;
+
+static void mm3_stream_job_run(void *ctx, size_t i) {
+    mm3_stream_batch *b = ctx;
+    const mm3_stream_job *j = &b->jobs[i];
+    if (j->src) {
+        memcpy(j->dst, j->src, (size_t)j->bytes);
+        return;
+    }
+    for (uint64_t done = 0; done < j->bytes;) {
+        const ssize_t r = pread(b->fd, j->dst + done, (size_t)(j->bytes - done), (off_t)(j->file_off + done));
+        if (r > 0) done += (uint64_t)r;
+        else if (r < 0 && errno == EINTR) continue;
+        else { b->failed = 1; return; }
+    }
+}
+
+static bool mm3_stream_run(mm3_stream *s, const mm3_stream_job *jobs, size_t n) {
+    if (n == 0) return true;
+    mm3_stream_batch b = { s->fd, jobs, 0 };
+    dispatch_apply_f(n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &b, mm3_stream_job_run);
+    if (b.failed) fprintf(stderr, "ds4: MiniMax expert read failed: %s\n", strerror(errno));
+    return !b.failed;
+}
+
+static void mm3_stream_free(mm3_stream *s) {
+    if (!s) return;
+    if (s->hits + s->misses) {
+        fprintf(stderr, "ds4: MiniMax expert cache: %llu hits, %llu misses (%.1f%% hit), "
+                "read %.2f GiB at %.2f GiB/s\n",
+                (unsigned long long)s->hits, (unsigned long long)s->misses,
+                100.0 * (double)s->hits / (double)(s->hits + s->misses),
+                (double)s->read_bytes / 1073741824.0,
+                s->read_ms > 0.0 ? (double)s->read_bytes / 1073741824.0 / (s->read_ms / 1000.0) : 0.0);
+    }
+    if (s->pool) { ds4_gpu_remove_host_map(s->pool); munmap(s->pool, (size_t)s->pool_bytes); }
+    if (s->layer) { ds4_gpu_remove_host_map(s->layer); munmap(s->layer, (size_t)s->layer_bytes); }
+    if (s->fd >= 0) close(s->fd);
+    free(s->slot);
+    free(s->owner);
+    free(s->stamp);
+    free(s);
+}
+
+static uint8_t *mm3_stream_host_alloc(uint64_t bytes, uint64_t max_range) {
+    void *p = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if (!ds4_gpu_add_host_map(p, bytes, max_range)) {
+        munmap(p, (size_t)bytes);
+        return NULL;
+    }
+    return p;
+}
+
+static mm3_stream *mm3_stream_create(const ds4_model *m, const ds4_weights *w, const char *path,
+                                     uint32_t n_slots) {
+    mm3_stream *s = xcalloc(1, sizeof(*s));
+    s->fd = -1;
+    if (DS4_N_EXPERT != MM3_EXPERTS) {
+        mm3_stream_free(s);
+        return NULL;
+    }
+    const ds4_layer_weights *l0 = &w->layer[DS4_N_LEADING_DENSE];
+    s->gate_bytes = l0->ffn_gate_exps->bytes / DS4_N_EXPERT;
+    s->down_bytes = l0->ffn_down_exps->bytes / DS4_N_EXPERT;
+    for (uint32_t il = DS4_N_LEADING_DENSE; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->ffn_gate_exps->bytes != s->gate_bytes * DS4_N_EXPERT ||
+            l->ffn_up_exps->bytes != s->gate_bytes * DS4_N_EXPERT ||
+            l->ffn_down_exps->bytes != s->down_bytes * DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: MiniMax SSD streaming needs one expert size in every layer\n");
+            mm3_stream_free(s);
+            return NULL;
+        }
+        s->file_off[il][0] = l->ffn_gate_exps->abs_offset;
+        s->file_off[il][1] = l->ffn_up_exps->abs_offset;
+        s->file_off[il][2] = l->ffn_down_exps->abs_offset;
+    }
+    /* A prefill chunk can touch every expert of a layer at once. */
+    const uint32_t max_slots = (DS4_N_LAYER - DS4_N_LEADING_DENSE) * DS4_N_EXPERT;
+    if (n_slots > max_slots) n_slots = max_slots;
+    if (n_slots < DS4_N_EXPERT) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming needs at least %u cached experts (have %u)\n",
+                DS4_N_EXPERT, n_slots);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    s->n_slots = n_slots;
+    const uint64_t expert_bytes = 2u * s->gate_bytes + s->down_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    s->pool_bytes = ((uint64_t)n_slots * expert_bytes + page - 1u) / page * page;
+    s->layer_bytes = ((uint64_t)DS4_N_EXPERT * expert_bytes + page - 1u) / page * page;
+    s->fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat a, b;
+    if (s->fd < 0 || fstat(s->fd, &a) || fstat(m->fd, &b) || a.st_dev != b.st_dev || a.st_ino != b.st_ino ||
+        fcntl(s->fd, F_NOCACHE, 1) || fcntl(s->fd, F_RDAHEAD, 0)) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming cannot open %s for expert reads\n", path);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    s->pool = mm3_stream_host_alloc(s->pool_bytes, (uint64_t)n_slots * s->down_bytes);
+    s->layer = s->pool ? mm3_stream_host_alloc(s->layer_bytes, (uint64_t)DS4_N_EXPERT * s->down_bytes) : NULL;
+    s->slot = malloc((size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(s->slot[0]));
+    s->owner = malloc((size_t)n_slots * sizeof(s->owner[0]));
+    s->stamp = calloc(n_slots, sizeof(s->stamp[0]));
+    if (!s->pool || !s->layer || !s->slot || !s->owner || !s->stamp) {
+        fprintf(stderr, "ds4: MiniMax SSD streaming could not allocate a %.2f GiB expert pool\n",
+                (double)s->pool_bytes / 1073741824.0);
+        mm3_stream_free(s);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < DS4_N_LAYER * DS4_N_EXPERT; i++) s->slot[i] = -1;
+    for (uint32_t i = 0; i < n_slots; i++) s->owner[i] = UINT32_MAX;
+    fprintf(stderr, "ds4: MiniMax SSD streaming: %u cached experts (%.2f GiB of %.2f GiB routed), "
+            "prefill layer buffer %.2f GiB\n",
+            n_slots, (double)s->pool_bytes / 1073741824.0,
+            (double)max_slots * (double)expert_bytes / 1073741824.0,
+            (double)s->layer_bytes / 1073741824.0);
+    return s;
+}
+
+static uint32_t mm3_stream_victim(mm3_stream *s) {
+    if (s->n_used < s->n_slots) return s->n_used++;
+    uint32_t best = UINT32_MAX;
+    for (uint32_t i = 0; i < s->n_slots; i++) {
+        if (s->stamp[i] != s->clock && (best == UINT32_MAX || s->stamp[i] < s->stamp[best])) best = i;
+    }
+    return best;
+}
+
+enum { MM3_HIT = 0, MM3_READ_POOL = 1, MM3_READ_LAYER = 2 };
+
+/* Plan layer il's experts named in ids[0..n): stamp the hits, give each miss
+ * a pool slot (decode: least recently used, never this layer's) or, for
+ * prefill, a free slot or a direct read into the layer buffer, and queue the
+ * reads.  A prefill chunk walks nearly every expert of every layer in turn, a
+ * cycle larger than the pool that LRU would turn into all misses, so prefill
+ * never evicts. */
+static bool mm3_stream_plan(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather,
+                            uint32_t *uniq, uint32_t *nu_out, uint8_t *state,
+                            mm3_stream_job *jobs, size_t *nj_out) {
+    uint32_t nu = 0;
+    bool seen[MM3_EXPERTS] = {0};
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= (int32_t)DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: MiniMax router chose expert %d in layer %u\n", ids[i], il);
+            return false;
+        }
+        if (!seen[ids[i]]) { seen[ids[i]] = true; uniq[nu++] = (uint32_t)ids[i]; }
+    }
+    int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    s->clock++;
+    /* stamp the hits first so no victim below is one of this layer's experts */
+    for (uint32_t i = 0; i < nu; i++) {
+        state[uniq[i]] = MM3_HIT;
+        if (row[uniq[i]] >= 0) { s->stamp[row[uniq[i]]] = s->clock; s->hits++; }
+    }
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    const uint64_t pool_part[3] = { 0, (uint64_t)s->n_slots * s->gate_bytes, 2u * (uint64_t)s->n_slots * s->gate_bytes };
+    const uint64_t layer_part[3] = { 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes, 2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes };
+    size_t nj = 0;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t e = uniq[i];
+        if (row[e] >= 0) continue;
+        s->misses++;
+        const uint32_t slot = gather ? (s->n_used < s->n_slots ? s->n_used++ : UINT32_MAX) : mm3_stream_victim(s);
+        if (slot == UINT32_MAX && !gather) return false;
+        state[e] = slot == UINT32_MAX ? MM3_READ_LAYER : MM3_READ_POOL;
+        if (slot != UINT32_MAX) {
+            if (s->owner[slot] != UINT32_MAX) s->slot[s->owner[slot]] = -1;
+            s->owner[slot] = il * DS4_N_EXPERT + e;
+            s->stamp[slot] = s->clock;
+            row[e] = (int32_t)slot;
+        }
+        for (uint32_t p = 0; p < 3; p++) {
+            uint8_t *dst = slot == UINT32_MAX ? s->layer + layer_part[p] + (uint64_t)e * part_bytes[p]
+                                              : s->pool + pool_part[p] + (uint64_t)slot * part_bytes[p];
+            jobs[nj++] = (mm3_stream_job){ dst, NULL, s->file_off[il][p] + (uint64_t)e * part_bytes[p], part_bytes[p] };
+            s->read_bytes += part_bytes[p];
+        }
+    }
+    *nu_out = nu;
+    *nj_out = nj;
+    return true;
+}
+
+/* Run the planned reads; on failure forget the slots they were filling. */
+static bool mm3_stream_read(mm3_stream *s, uint32_t il, const uint32_t *uniq, uint32_t nu, const uint8_t *state,
+                            const mm3_stream_job *jobs, size_t nj) {
+    const double t0 = now_sec();
+    if (!mm3_stream_run(s, jobs, nj)) {
+        int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+        for (uint32_t i = 0; i < nu; i++) {
+            if (state[uniq[i]] != MM3_READ_POOL) continue;
+            s->owner[row[uniq[i]]] = UINT32_MAX;
+            row[uniq[i]] = -1;
+        }
+        return false;
+    }
+    s->read_ms += (now_sec() - t0) * 1000.0;
+    return true;
+}
+
+/* Make layer il's experts available: in the pool for decode and, for prefill,
+ * gathered into the layer buffer at their own index. */
+static bool mm3_stream_load(mm3_stream *s, uint32_t il, const int32_t *ids, uint32_t n, bool gather) {
+    uint32_t uniq[MM3_EXPERTS], nu = 0;
+    uint8_t state[MM3_EXPERTS];
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj = 0;
+    if (!mm3_stream_plan(s, il, ids, n, gather, uniq, &nu, state, jobs, &nj) ||
+        !mm3_stream_read(s, il, uniq, nu, state, jobs, nj)) {
+        return false;
+    }
+    if (!gather) return true;
+    const uint64_t part_bytes[3] = { s->gate_bytes, s->gate_bytes, s->down_bytes };
+    const uint64_t pool_part[3] = { 0, (uint64_t)s->n_slots * s->gate_bytes, 2u * (uint64_t)s->n_slots * s->gate_bytes };
+    const uint64_t layer_part[3] = { 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes, 2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes };
+    const int32_t *row = s->slot + (uint64_t)il * DS4_N_EXPERT;
+    nj = 0;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t e = uniq[i];
+        if (state[e] == MM3_READ_LAYER) continue;
+        for (uint32_t p = 0; p < 3; p++) {
+            jobs[nj++] = (mm3_stream_job){ s->layer + layer_part[p] + (uint64_t)e * part_bytes[p],
+                                           s->pool + pool_part[p] + (uint64_t)row[e] * part_bytes[p],
+                                           0, part_bytes[p] };
+        }
+    }
+    return mm3_stream_run(s, jobs, nj);
+}
+
+/* Where one MoE layer reads its routed experts. */
+typedef struct {
+    const void *map;
+    uint64_t size, gate, up, down;
+    uint32_t n_total;
+} mm3_experts;
+
 typedef struct {
     uint32_t ctx_cap;
     uint32_t cap_tokens;     /* rows per forward call (the prefill chunk) */
@@ -60794,6 +61084,7 @@ typedef struct {
     float *host_rows;
     float rope_freq[32];
     uint64_t bytes;
+    mm3_stream *stream;      /* engine-owned; NULL when the experts are mapped */
 } ds4_mm3_graph;
 
 static void mm3_graph_free(ds4_mm3_graph *g) {
@@ -60904,6 +61195,91 @@ static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_
            ds4_gpu_add_tensor(g->x, g->x, g->blk, T * E);
 }
 
+/* Load the experts the router just chose and point x at them.  Decode rows
+ * get their ids rewritten to pool slots; prefill chunks read the gathered
+ * layer buffer with natural ids.  Single-token decode overlaps its reads with
+ * GPU work instead (mm3_graph_stream_decode_moe).  shortcut: other decode
+ * batches and prefill wait for their reads; prefetch the next prefill layer
+ * when long-prompt speed matters. */
+static bool mm3_graph_stream_experts(ds4_mm3_graph *g, uint32_t il, uint32_t T, bool gather, mm3_experts *x) {
+    mm3_stream *s = g->stream;
+    const uint32_t n = T * DS4_N_EXPERT_USED;
+    if (!ds4_gpu_end_commands()) return false;
+    int32_t *ids = ds4_gpu_tensor_contents(g->selected);
+    if (!ids || !mm3_stream_load(s, il, ids, n, gather)) return false;
+    if (gather) {
+        *x = (mm3_experts){ s->layer, s->layer_bytes, 0, (uint64_t)DS4_N_EXPERT * s->gate_bytes,
+                            2u * (uint64_t)DS4_N_EXPERT * s->gate_bytes, DS4_N_EXPERT };
+    } else {
+        for (uint32_t i = 0; i < n; i++) ids[i] = s->slot[(uint64_t)il * DS4_N_EXPERT + (uint32_t)ids[i]];
+        *x = (mm3_experts){ s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
+                            2u * (uint64_t)s->n_slots * s->gate_bytes, s->n_slots };
+    }
+    return glm_graph_begin_commands_if_needed();
+}
+
+/* Routed slots [s0, s0 + ns) of a one-token decode, reading the pool. */
+static bool mm3_graph_routed_slots(ds4_mm3_graph *g, const ds4_layer_weights *l, const mm3_experts *x,
+                                   uint32_t s0, uint32_t ns) {
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_view(g->selected, (uint64_t)s0 * 4u, (uint64_t)ns * 4u);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_view(g->mid, (uint64_t)s0 * F * 4u, (uint64_t)ns * F * 4u);
+    ds4_gpu_tensor *part = ds4_gpu_tensor_view(g->part, (uint64_t)s0 * E * 4u, (uint64_t)ns * E * 4u);
+    const bool ok = sel && mid && part &&
+        ds4_gpu_qwen4_moe_mid_tensor(mid, g->xn, sel, x->map, x->size, x->gate, x->up,
+                                     l->ffn_gate_exps->type, x->n_total, 1, ns, E, F, 0, 0, UINT32_MAX) &&
+        ds4_gpu_qwen4_moe_down_tensor(part, mid, sel, x->map, x->size, x->down,
+                                      l->ffn_down_exps->type, x->n_total, 1, ns, F, E, 0, UINT32_MAX);
+    ds4_gpu_tensor_free(sel);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(part);
+    return ok;
+}
+
+/* One-token decode MoE with the SSD reads hidden behind GPU work: the shared
+ * expert and the slots whose experts are already pooled are committed first,
+ * the missing experts are read while they run, then the remaining slots and
+ * the reduce follow.  Slots stay in router order, so the reduce sums exactly
+ * as the unsplit path does. */
+static bool mm3_graph_stream_decode_moe(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t il) {
+    mm3_stream *s = g->stream;
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
+    if (!ds4_gpu_end_commands()) return false;
+    int32_t *ids = ds4_gpu_tensor_contents(g->selected);
+    uint32_t uniq[MM3_EXPERTS], nu = 0;
+    uint8_t state[MM3_EXPERTS];
+    mm3_stream_job jobs[3 * MM3_EXPERTS];
+    size_t nj = 0;
+    if (!ids || !mm3_stream_plan(s, il, ids, U, false, uniq, &nu, state, jobs, &nj)) return false;
+    bool missing[MM3_EXPERTS] = {0};   /* by slot: expert still being read */
+    for (uint32_t i = 0; i < U; i++) {
+        missing[i] = state[ids[i]] != MM3_HIT;
+        ids[i] = s->slot[(uint64_t)il * DS4_N_EXPERT + (uint32_t)ids[i]];
+    }
+    const mm3_experts x = { s->pool, s->pool_bytes, 0, (uint64_t)s->n_slots * s->gate_bytes,
+                            2u * (uint64_t)s->n_slots * s->gate_bytes, s->n_slots };
+    bool ok = glm_graph_begin_commands_if_needed() &&
+              qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, 1) &&
+              qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, 1) &&
+              ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, F) &&
+              qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, 1);
+    for (uint32_t pass = 0; pass < 2 && ok; pass++) {
+        /* contiguous runs of ready (pass 0) or just-read (pass 1) slots */
+        for (uint32_t s0 = 0; s0 < U && ok;) {
+            if (missing[s0] != (pass == 1)) { s0++; continue; }
+            uint32_t s1 = s0 + 1;
+            while (s1 < U && missing[s1] == (pass == 1)) s1++;
+            ok = mm3_graph_routed_slots(g, l, &x, s0, s1 - s0);
+            s0 = s1;
+        }
+        if (pass == 0 && ok && nj != 0) {
+            ok = ds4_gpu_flush_commands() != 0 && mm3_stream_read(s, il, uniq, nu, state, jobs, nj);
+        }
+    }
+    return ok && ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, 1, U, U, E, 2u);
+}
+
 static bool mm3_graph_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                           uint32_t il, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, U = DS4_N_EXPERT_USED;
@@ -60924,32 +61300,40 @@ static bool mm3_graph_ffn(ds4_mm3_graph *g, const ds4_model *m, const ds4_layer_
                                    DS4_EXPERT_WEIGHT_SCALE)) {
         return false;
     }
-    if (T > MM3_MOE_MM_MIN) {
-        /* the shared expert as dense GEMMs beside the expert-grouped tiles */
-        return ds4_gpu_qwen4_moe_build_lists_tensor(g->lists, g->counts, g->selected, T, U, DS4_N_EXPERT,
-                                                    g->cap_tokens) &&
-               ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, m->map, m->size,
-                                               l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                               l->ffn_gate_exps->type, DS4_N_EXPERT, T, U, U, E, F,
-                                               g->cap_tokens) &&
-               ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, m->map, m->size,
-                                                l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
-                                                DS4_N_EXPERT, T, U, U, F, E, g->cap_tokens) &&
-               qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, T) &&
-               qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, T) &&
-               ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, T * F) &&
-               qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, T) &&
-               ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, T, U, U, E, 2u);
+    if (g->stream && T == 1) return mm3_graph_stream_decode_moe(g, m, l, il);
+    const bool mm = T > MM3_MOE_MM_MIN;
+    mm3_experts x = { m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                      l->ffn_down_exps->abs_offset, DS4_N_EXPERT };
+    if (g->stream && !mm3_graph_stream_experts(g, il, T, mm, &x)) return false;
+    if (!mm && !g->stream) {
+        return ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, x.map, x.size, x.gate, x.up,
+                                            l->ffn_gate_exps->type, x.n_total, T, U, E, F,
+                                            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                            l->ffn_gate_shexp->type) &&
+               ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, x.map, x.size, x.down,
+                                             l->ffn_down_exps->type, x.n_total, T, U, F, E,
+                                             l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
+               ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, NULL, T, U, U + 1u, E, 1u);
     }
-    return ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, m->map, m->size,
-                                        l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                        l->ffn_gate_exps->type, DS4_N_EXPERT, T, U, E, F,
-                                        l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                        l->ffn_gate_shexp->type) &&
-           ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
-                                         l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, DS4_N_EXPERT,
-                                         T, U, F, E, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
-           ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, NULL, T, U, U + 1u, E, 1u);
+    /* The fused decode kernels read the shared expert from the routed map, so
+     * with streamed experts it runs as dense GEMMs like the prefill path. */
+    const bool routed = mm ?
+        ds4_gpu_qwen4_moe_build_lists_tensor(g->lists, g->counts, g->selected, T, U, x.n_total,
+                                             g->cap_tokens) &&
+        ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->lists, g->counts, x.map, x.size, x.gate, x.up,
+                                        l->ffn_gate_exps->type, x.n_total, T, U, U, E, F, g->cap_tokens) &&
+        ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->lists, g->counts, x.map, x.size, x.down,
+                                         l->ffn_down_exps->type, x.n_total, T, U, U, F, E, g->cap_tokens) :
+        ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, x.map, x.size, x.gate, x.up,
+                                     l->ffn_gate_exps->type, x.n_total, T, U, E, F, 0, 0, UINT32_MAX) &&
+        ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, x.map, x.size, x.down,
+                                      l->ffn_down_exps->type, x.n_total, T, U, F, E, 0, UINT32_MAX);
+    return routed &&
+           qwen4_gemv(g->ff_gate, m, l->ffn_gate_shexp, g->xn, T) &&
+           qwen4_gemv(g->ff_up, m, l->ffn_up_shexp, g->xn, T) &&
+           ds4_gpu_mm3_glu_tensor(g->ff_mid, g->ff_gate, g->ff_up, T * F) &&
+           qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->ff_mid, T) &&
+           ds4_gpu_mm3_moe_reduce_tensor(g->x, g->part, g->weights, g->sh_out, T, U, U, E, 2u);
 }
 
 /* Forward T tokens at g->pos; logits_out (optional) gets the last row. */
@@ -66383,7 +66767,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
+        ds4_session_is_minimax3(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -66863,7 +67248,8 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        /* MiniMax has no one-shot raw-SWA generator; the session path is its only decode. */
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -72646,10 +73032,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             false;
 #endif
         if (!metal || opt->tp.role != DS4_TP_NONE || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            load_slice || e->ssd_streaming || opt->dspark || opt->glm_mtp || e->power_percent != 100 ||
+            load_slice || opt->dspark || opt->glm_mtp || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0]) || (opt->vision_path && opt->vision_path[0])) {
             fprintf(stderr, "ds4: MiniMax-M3.1-Flash currently runs on single-host Metal only; "
-                            "SSD streaming, tensor/pipeline parallelism, DSpark, MTP, vision and "
+                            "tensor/pipeline parallelism, DSpark, MTP, vision and "
                             "power throttling are not supported yet\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -73547,7 +73933,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_minimax3()) {
                 spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
             } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
@@ -73732,6 +74118,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#ifdef DS4_HAS_QWEN4_METAL
+        if (e->ssd_streaming && ds4_model_is_minimax3()) {
+            /* the prefill layer buffer comes out of the planned prefill headroom */
+            e->mm3_stream = mm3_stream_create(&e->model, &e->weights, opt->model_path,
+                                              e->ssd_streaming_cache_experts);
+            if (!e->mm3_stream) {
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+#endif
         if (tp_shard && e->backend == DS4_BACKEND_METAL) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
@@ -73989,6 +74389,19 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_minimax3(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_minimax3();
+}
+
+const char *ds4_minimax3_root_system(void) {
+    return DS4_MINIMAX3_ROOT_SYSTEM;
+}
+
+const char *ds4_minimax3_effort(ds4_think_mode mode) {
+    return minimax3_effort(mode);
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
@@ -74846,6 +75259,10 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
+    mm3_stream_free(e->mm3_stream);
+    e->mm3_stream = NULL;
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
     if (e->qwen4_shared_workspace) {
@@ -75109,6 +75526,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        s->mm3->stream = e->mm3_stream;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));

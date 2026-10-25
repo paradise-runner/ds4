@@ -141,10 +141,13 @@ class Quantizer(gq.Quantizer):
         return (values.reshape(rows, cols // 16, 16) * scale[:, :, None]).reshape(rows, cols)
 
 
+_base_transform_regular = gq.transform_regular  # main() monkeypatches gq.transform_regular
+
+
 def transform_regular(values, item):
     if item.transform == GEMMA_NORM:
         return values + 1.0
-    return gq.transform_regular(values, item)
+    return _base_transform_regular(values, item)
 
 
 def add(plan, db, name, source, qtype, role, transform=None):
@@ -172,14 +175,14 @@ def add_experts(plan, db, layer, part, source_part, qtype):
     plan.append(item)
 
 
-def build_plan(db, artifact):
+def build_plan(db, artifact, n_layer=N_LAYER):
     plan = []
     add(plan, db, "token_embd.weight", f"{PREFIX}.embed_tokens.weight", QTYPE_Q8_0, "embedding")
     routed = {
         "q2": {"gate": QTYPE_IQ2_XXS, "up": QTYPE_IQ2_XXS, "down": QTYPE_Q2_K},
         "q4": {"gate": QTYPE_Q4_K, "up": QTYPE_Q4_K, "down": QTYPE_Q4_K},
     }[artifact]
-    for layer in range(N_LAYER):
+    for layer in range(n_layer):
         p = f"{PREFIX}.layers.{layer}"
         a = f"{p}.self_attn"
         add(plan, db, f"blk.{layer}.attn_norm.weight", f"{p}.input_layernorm.weight", QTYPE_F32, "norm", GEMMA_NORM)
@@ -250,7 +253,7 @@ def tokenizer_records(hf_dir):
     ]
 
 
-def model_metadata(hf_dir, source_revision):
+def model_metadata(hf_dir, source_revision, n_layer=N_LAYER):
     config = read_json(hf_dir, "config.json")
     if not isinstance(config.get("text_config"), dict):
         raise ValueError("config.json has no text_config")
@@ -279,7 +282,7 @@ def model_metadata(hf_dir, source_revision):
         kv_string("general.name", "MiniMax-M3.1-Flash"),
         kv_u32("general.alignment", gq.GGUF_ALIGNMENT),
         kv_string("general.source.revision", source_revision),
-        kv_u32(f"{a}.block_count", N_LAYER),
+        kv_u32(f"{a}.block_count", n_layer),
         kv_u64(f"{a}.context_length", text["max_position_embeddings"]),
         kv_u32(f"{a}.embedding_length", N_EMBD),
         kv_u32(f"{a}.vocab_size", N_VOCAB),
@@ -322,9 +325,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--layers", type=int, default=N_LAYER,
+                        help="keep only the first N layers (validation GGUF, like minimax31_truncate.py)")
     args = parser.parse_args()
     if not args.dry_run and not args.out:
         parser.error("--out is required unless --dry-run is used")
+    if not N_DENSE < args.layers <= N_LAYER:
+        parser.error(f"--layers must be between {N_DENSE + 1} and {N_LAYER}")
 
     # The shared writer looks these up at module level.
     gq.Quantizer = Quantizer
@@ -333,8 +340,8 @@ def main():
     db = gq.SourceDB(args.hf, index_validator=validate_index, scale_validator=no_scale_check,
                      tensor_prefix="language_model.")
     try:
-        plan = build_plan(db, args.artifact)
-        kv = model_metadata(args.hf, args.source_revision)
+        plan = build_plan(db, args.artifact, args.layers)
+        kv = model_metadata(args.hf, args.source_revision, args.layers)
         tok = tokenizer_records(args.hf)
         if args.dry_run:
             gq.print_plan(plan, kv, tok)

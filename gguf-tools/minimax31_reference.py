@@ -17,7 +17,10 @@ and is the golden source for the ds4 graph:
   SwiGLU-OAI: g = min(g, 7); u = clip(u, -7, 7); g * sigmoid(1.702 g) * (u + 1)
 
 Runs on the CPU one token at a time; meant for a few dozen tokens.  Routed
-experts are dequantized on first use and cached per layer for the run.
+experts are dequantized on every use, never cached: one f32 expert is 226 MB,
+so caching every expert a run touches would not fit in memory.
+--layers N stops after N layers and still applies the final norm and lm_head,
+matching a minimax31_truncate.py --layers N GGUF.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ P = mq.PREFIX
 
 
 class Model:
-    def __init__(self, hf_dir, block_size=None):
+    def __init__(self, hf_dir, block_size=None, n_layers=60):
         self.db = gq.SourceDB(hf_dir, index_validator=mq.validate_index,
                               scale_validator=mq.no_scale_check, tensor_prefix="language_model.")
         self.q = mq.Quantizer(os.path.join(os.path.dirname(os.path.abspath(__file__)), "libds4quants.dylib"))
@@ -53,8 +56,8 @@ class Model:
         self.alpha, self.limit = cfg["swiglu_alpha"], cfg["swiglu_limit"]
         self.scale = cfg["routed_scaling_factor"]
         self.n_used = cfg["num_experts_per_tok"]
+        self.n_layers = n_layers
         self.cache = {}
-        self.experts = {}
 
     def w(self, name):
         if name not in self.cache:
@@ -90,11 +93,8 @@ class Model:
         return self.w(f"{prefix}.down_proj.weight") @ self.act(g, u)
 
     def expert(self, layer, e):
-        key = (layer, e)
-        if key not in self.experts:
-            b = f"{P}.layers.{layer}.block_sparse_moe.experts.{e}"
-            self.experts[key] = tuple(self.q.to_f32(self.db, f"{b}.{p}.weight_packed") for p in ("w1", "w3", "w2"))
-        return self.experts[key]
+        b = f"{P}.layers.{layer}.block_sparse_moe.experts.{e}"
+        return tuple(self.q.to_f32(self.db, f"{b}.{p}.weight_packed") for p in ("w1", "w3", "w2"))
 
     def moe(self, x, layer):
         m = f"{P}.layers.{layer}.block_sparse_moe"
@@ -148,11 +148,11 @@ class Model:
     def forward(self, tokens, n_ctx):
         kv = [dict(k=np.zeros((n_ctx, self.n_kv, self.hd), np.float32),
                    v=np.zeros((n_ctx, self.n_kv, self.hd), np.float32),
-                   ik=np.zeros((n_ctx, self.hd), np.float32)) for _ in range(60)]
+                   ik=np.zeros((n_ctx, self.hd), np.float32)) for _ in range(self.n_layers)]
         embed = self.w(f"{P}.embed_tokens.weight")
         for pos, tok in enumerate(tokens):
             x = embed[tok].astype(np.float32)
-            for layer in range(60):
+            for layer in range(self.n_layers):
                 p = f"{P}.layers.{layer}"
                 x = x + self.attention(self.rms(x, self.norm_w(f"{p}.input_layernorm.weight")), layer, pos, kv[layer])
                 h = self.rms(x, self.norm_w(f"{p}.post_attention_layernorm.weight"))
@@ -167,9 +167,12 @@ def main():
     ap.add_argument("--generate", type=int, default=4, help="greedy tokens after the prompt")
     ap.add_argument("--block-size", type=int, help="override the sparse block size to exercise selection")
     ap.add_argument("--out", help="write per-position top-20 logits as JSON")
+    ap.add_argument("--layers", type=int, default=60, help="run only the first N layers (truncated-GGUF checks)")
     args = ap.parse_args()
+    if args.layers < 1 or args.layers > 60:
+        ap.error("--layers must be between 1 and 60")
     tokens = [int(t) for t in args.tokens.split(",")]
-    model = Model(args.hf, args.block_size)
+    model = Model(args.hf, args.block_size, args.layers)
     n_prompt = len(tokens)
     rows = []
     stream = model.forward(tokens, n_prompt + args.generate)

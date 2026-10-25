@@ -1701,7 +1701,7 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
-static int ds4_gpu_warm_model_views(void);
+static int ds4_gpu_warm_model_views(const void *only_map);
 static double ds4_gpu_gib(uint64_t bytes);
 
 static double ds4_gpu_now_ms(void) {
@@ -2351,7 +2351,7 @@ static int ds4_gpu_finish_model_views(
             warmed = 1;
         } else {
             ds4_gpu_progress_begin("warming Metal model views");
-            warmed = ds4_gpu_warm_model_views();
+            warmed = ds4_gpu_warm_model_views(NULL);
             if (warmed) ds4_gpu_progress_done();
             else ds4_gpu_progress_failed();
         }
@@ -2926,7 +2926,8 @@ static void ds4_gpu_detect_metal4_features(void) {
 #endif
 }
 
-static int ds4_gpu_warm_model_views(void) {
+/* only_map: warm just that map's views (NULL: all). */
+static int ds4_gpu_warm_model_views(const void *only_map) {
     if (g_model_view_count == 0) return 1;
 
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_touch_u8_stride");
@@ -2954,6 +2955,7 @@ static int ds4_gpu_warm_model_views(void) {
 
     uint64_t total_touches = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (only_map && g_model_views[i].model_map != only_map) continue;
         total_touches += (g_model_views[i].bytes + stride - 1) / stride;
     }
     if (total_touches == 0 || total_touches > (uint64_t)NSUIntegerMax) return 0;
@@ -2977,6 +2979,7 @@ static int ds4_gpu_warm_model_views(void) {
     [enc setComputePipelineState:pipeline];
     uint64_t dst_offset = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (only_map && g_model_views[i].model_map != only_map) continue;
         const uint64_t bytes = g_model_views[i].bytes;
         const uint64_t n = (bytes + stride - 1) / stride;
         [enc setBuffer:g_model_views[i].buffer offset:0 atIndex:0];
@@ -12776,6 +12779,26 @@ int ds4_gpu_set_model_map_spans(
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
+}
+
+int ds4_gpu_add_host_map(const void *map, uint64_t bytes, uint64_t max_range_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!map || bytes == 0 || max_range_bytes == 0 || max_range_bytes > bytes) return 0;
+    @autoreleasepool {
+        ds4_gpu_model_views_remove_map(map);
+        /* Map it into the GPU now: the first command binding a fresh
+         * multi-GiB allocation otherwise pays this inside a token. */
+        if (!ds4_gpu_add_model_view_range(map, bytes, 0, bytes, max_range_bytes, false, NULL) ||
+            !ds4_gpu_warm_model_views(map)) {
+            ds4_gpu_model_views_remove_map(map);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void ds4_gpu_remove_host_map(const void *map) {
+    if (map) ds4_gpu_model_views_remove_map(map);
 }
 
 int ds4_gpu_set_model_fd(int fd) {
