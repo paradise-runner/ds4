@@ -59574,8 +59574,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             flush_layer = (uint32_t)layer;
         }
     }
+    /* Stage the PLE rows inside the layer loop so the GPU runs the layers
+     * before the PLE layer while they load; set to stage them up front. */
+    const bool ple_overlap = getenv("DS4_QWEN4_NO_PLE_OVERLAP") == NULL;
     const double t0 = timing ? now_sec() : 0.0;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    if (!ple_overlap && !qwen4_graph_stage_ple(g, m, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -59596,8 +59600,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
-            if (il > 0u) ok = ds4_gpu_flush_commands() != 0;
-            ok = ok && qwen4_graph_stage_ple(g, m, tokens, T) &&
+            if (ple_overlap) {
+                if (il > 0u) ok = ds4_gpu_flush_commands() != 0;
+                ok = ok && qwen4_graph_stage_ple(g, m, tokens, T);
+            }
+            ok = ok &&
                  qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
@@ -59654,7 +59661,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
          * end_commands below waits for both batches before inputs are reused. */
         /* The PLE flush leaves the GPU only layer 1 while the host encodes
          * the rest; a second flush hands it the next layers as well. */
-        if (ok && flush_layer && (il + 1u == flush_layer || il + 1u == 2u * flush_layer))
+        if (ok && flush_layer && (il + 1u == flush_layer || (ple_overlap && il + 1u == 2u * flush_layer)))
             ok = ds4_gpu_flush_commands() != 0;
     }
     if (prof_on) {

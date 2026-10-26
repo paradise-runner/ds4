@@ -48324,7 +48324,8 @@ typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
-    uint32_t list_cap, pad0;
+    uint32_t list_cap;
+    uint32_t n_hc;         /* kernel_qwen4_moe_down_reduce only; 0 elsewhere */
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {

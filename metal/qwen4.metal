@@ -2622,7 +2622,7 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
     uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
-    uint32_t pad0;
+    uint32_t n_hc;         /* kernel_qwen4_moe_down_reduce only, 0 elsewhere; mirrors qwen4_moe_args in ds4_metal.m */
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -3210,7 +3210,7 @@ kernel void kernel_qwen4_moe_down_reduce(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[17][QWEN4_DOWN_REDUCE_ROWS];
     threadgroup float wgt[8];
-    const uint n_hc = args.pad0, ns = args.n_slots, slot = sgitg;
+    const uint n_hc = args.n_hc, ns = args.n_slots, slot = sgitg;
     if (tid < n_hc) wgt[tid] = qwen4_hc_inject_weight(inj, n_hc, tid);
     const uint dim = is_function_constant_defined(qwen4_mv_dim) ? qwen4_mv_dim : args.in_dim;
     const uint wt = is_function_constant_defined(qwen4_mv_type) ? qwen4_mv_type : args.weight_type;
