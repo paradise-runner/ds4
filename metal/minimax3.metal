@@ -2,7 +2,7 @@
 // Attention (indexer block scores, per-KV-head top-k block selection,
 // block-sparse GQA attention), sigmoid router and the MoE combine.  The
 // routed expert matmuls reuse the qwen4 MoE kernels with the SwiGLU-OAI
-// activation (qwen4_glu act 1); this file is appended after qwen4.metal.
+// activation (qwen4_swiglu_oai); this file is appended after qwen4.metal.
 
 #define MM3_MAX_ROT_PAIRS 32
 
@@ -445,7 +445,7 @@ kernel void kernel_mm3_glu(
         device float       *out,
         uint gid [[thread_position_in_grid]]) {
     if (gid >= args.n) return;
-    out[gid] = qwen4_glu(gate[gid], up[gid], 1u);
+    out[gid] = qwen4_swiglu_oai(gate[gid], up[gid]);
 }
 
 // Publish the decode router's choice to the CPU without waiting for the
