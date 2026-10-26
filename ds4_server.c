@@ -7852,6 +7852,8 @@ static size_t dsml_max_tool_start_len(void) {
         size_t n = strlen(dsml_syntaxes[i].tool_calls_start);
         if (n > max) max = n;
     }
+    /* MiniMax's start marker is longer than any DSML one. */
+    if (strlen(MM_TOOL_CALLS_START) > max) max = strlen(MM_TOOL_CALLS_START);
     return max;
 }
 
@@ -8151,6 +8153,15 @@ structural:
                 }
                 dt->pos = (size_t)(tag_end - raw) + 1;
                 continue;
+            }
+            /* MiniMax's param_start (ns + "<") also prefixes its invoke and
+             * end markers; wait until a streamed marker is unambiguous. */
+            if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_end))
+            {
+                dt->decode = DSML_DECODE_STRUCTURAL;
+                return;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
                 size_t tag_start = dt->pos;
@@ -21181,6 +21192,25 @@ static void test_tool_control_text_inside_arguments(void) {
     }
 }
 
+static void test_minimax_decode_tracker_markers(void) {
+    /* Sampled text from a live trace; the server reported it as unterminated. */
+    const char *raw = "</think>I'll check." MM_TOOL_CALLS_START "\n"
+        MM_NS "<invoke name=\"bash\">" MM_NS "<command>wc -l /etc/hosts && cat -A /etc/hosts"
+        MM_NS "</command>" MM_NS "</invoke>\n" MM_TOOL_CALLS_END;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_MINIMAX;
+    bool start = false, end = false, orphan = false;
+    size_t len = strlen(raw);
+    for (size_t n = 1; n <= len; n++) {
+        dsml_decode_tracker_update(&tracker, raw, n);
+        char *prefix = xstrndup(raw, n);
+        observe_tool_markers(&tracker, prefix, &start, &end, &orphan);
+        free(prefix);
+    }
+    TEST_ASSERT(start && end && !orphan);
+}
+
 static void test_qwen_decode_tracker_markers(void) {
     const char *raw = "<tool_call>\n<function=write>\n<parameter=content>\n"
                       "literal </tool_call> </think> <think>\n"
@@ -23482,6 +23512,7 @@ static void ds4_server_unit_tests_run(void) {
     test_minimax_tool_call_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
+    test_minimax_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
