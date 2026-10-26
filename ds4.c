@@ -61328,8 +61328,11 @@ static bool mm3_graph_attention(ds4_mm3_graph *g, const ds4_model *m, const ds4_
                                              E, T, DS4_RMS_EPS)) {
         return false;
     }
-    /* the five projections of xn are independent: one concurrent section */
-    const bool conc = ds4_gpu_concurrent_begin() != 0;
+    /* the five projections of xn are independent: one concurrent section.
+     * Not for 5..32 rows: the Q8 batch matmul then splits k through one
+     * shared partials buffer and a reduce dispatch, which a concurrent
+     * encoder neither orders nor keeps apart across projections. */
+    const bool conc = (T < 5u || T > 32u) && ds4_gpu_concurrent_begin() != 0;
     const bool proj = qwen4_gemv(g->qp, m, l->attn_q, g->xn, T) &&
                       qwen4_gemv(g->kp, m, l->attn_k, g->xn, T) &&
                       qwen4_gemv(g->vp, m, l->attn_v, g->xn, T) &&
